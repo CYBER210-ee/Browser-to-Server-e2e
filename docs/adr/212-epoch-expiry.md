@@ -56,18 +56,18 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
 - [x] `docs/threat-model.md`: stored history as a protected asset; the limitations above
 
 ### 2. Server storage module (`server/history_store.py`)
-- [ ] Epoch key store on SQLite (stdlib) — insert, list live, erase expired
-- [ ] Record store on Postgres via psycopg, TLS `verify-full` with the DB CA
-- [ ] Sweeper (on connect + timer) and policy loading (`EPOCH_LENGTH`, `HISTORY_WINDOW`,
+- [x] Epoch key store on SQLite (stdlib) — insert, list live, erase expired
+- [x] Record store on Postgres via psycopg, TLS `verify-full` with the DB CA
+- [x] Sweeper (on connect + timer) and policy loading (`EPOCH_LENGTH`, `HISTORY_WINDOW`,
       `DATABASE_URL`, `DB_CA_PATH`, `EPOCH_DB_PATH`)
 
 ### 3. Server protocol (`server/hpke_server.py`, `server/main.py`)
-- [ ] Session tracks owner from `hello`
-- [ ] `TYPE_EPOCH_KEY = 0x04`, `TYPE_HISTORY = 0x05`; AAD builder takes a type
-- [ ] Handle `epoch_key` frame in ESTABLISHED; reject records for unknown epochs
-- [ ] Parse structured `msg` plaintext, echo `text`, store `rec`
-- [ ] Push `history` frame right after `server_hello` (s2c seq 0)
-- [ ] Mirror both files into `echovault-deploy/echo_server/`
+- [x] Session tracks owner from `hello`
+- [x] `TYPE_EPOCH_KEY = 0x04`, `TYPE_HISTORY = 0x05`; AAD builder takes a type
+- [x] Handle `epoch_key` frame in ESTABLISHED; reject records for unknown epochs
+- [x] Parse structured `msg` plaintext, echo `text`, store `rec`
+- [x] Push `history` frame right after `server_hello` (s2c seq 0)
+- [x] Mirror server files (incl. new `secure_link.py`, `history_store.py`) into `echovault-deploy/echo_server/`
 
 ### 4. Client (`client/app/page.tsx`)
 - [ ] Epoch keypair minting, sealing epoch private key to the identity key, `epoch_key` upload
@@ -84,9 +84,9 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
 - [ ] README setup section replaced with build/run instructions (local dev + compose)
 
 ### 6. Tests and checks
-- [ ] pytest: epoch key store + sweeper expiry; record store (Postgres only when
+- [x] pytest: epoch key store + sweeper expiry; record store (Postgres only when
       `DATABASE_URL` is set, fake otherwise)
-- [ ] pytest: full handshake + `history` push + `epoch_key` + structured `msg` with a
+- [x] pytest: full handshake + `history` push + `epoch_key` + structured `msg` with a
       Python-side browser (pyhpke both sides); fail-closed gates
 - [ ] `npm run lint` and `npm run build` in `client/`
 

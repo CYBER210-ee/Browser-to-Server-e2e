@@ -1,32 +1,51 @@
 """
-server/main.py — EchoVault echo server (protocol v1 frozen)
+server/main.py — EchoVault echo server (protocol v1 + ADR 212 history)
 
 Endpoints:
   GET /api/health   → {"status":"ok"}
   GET /api/status   → {"status":"online","websocket_route":"/ws"}
   GET /pubkey       → {server_x25519, server_ed25519, sig}  (§5.1)
   GET /api/pubkey   → alias (backward compat)
-  WS  /ws           → HPKE echo, strict state machine (§5.6)
-  WS  /ws/plain     → plaintext echo — demo exhibit (b): E2E OFF, mitmweb sees cleartext
+  WS  /ws           → HPKE echo + stored history, strict state machine (§5.6)
+  WS  /ws/plain     → plaintext echo — demo exhibit (b): E2E OFF, no history
 """
 
+import asyncio
 import json
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 from hpke_server import (
-    ServerKeys, ServerSession, ProtocolError,
-    b64url_encode, load_server_keys, build_t_pubkey,
+    ServerKeys, ProtocolError, b64url_encode, load_server_keys, build_t_pubkey,
 )
+from history_store import HistoryService, open_history_service
+from secure_link import serve_secure_link
 
 load_dotenv()
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])  # demo only
 SERVER_KEYS: ServerKeys = load_server_keys()
+HISTORY: HistoryService | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Stores open at startup (fail loudly if the DB is misconfigured — D024) and
+    # the sweeper erases expired epoch keys on a timer as well as per connection.
+    global HISTORY
+    HISTORY = open_history_service()
+    sweeper = asyncio.create_task(HISTORY.run_sweeper())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        HISTORY.close()
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])  # demo only
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────────
@@ -69,42 +88,11 @@ async def get_pubkey_alias():
 @app.websocket("/ws")
 async def ws_hpke(websocket: WebSocket):
     """
-    Strict HPKE echo endpoint.
-    Phase machine: AWAIT_HELLO → (hello) → ESTABLISHED → (msg…)
-    Any protocol fault → close 4001; no plaintext fallback.
+    Strict HPKE echo endpoint. Any protocol fault → close 4001; no plaintext fallback.
     """
     await websocket.accept()
-    session = ServerSession(keys=SERVER_KEYS)
-
     try:
-        while True:
-            try:
-                frame = json.loads(await websocket.receive_text())
-            except Exception as e:
-                raise ProtocolError(f"malformed/non-JSON frame: {e}")
-
-            frame_type = frame.get("type")
-
-            if session.phase == "AWAIT_HELLO":
-                if frame_type != "hello":
-                    raise ProtocolError(f"expected hello in AWAIT_HELLO, got {frame_type!r}")
-                server_hello = session.handle_hello(frame)
-                await websocket.send_text(json.dumps(server_hello))
-
-            elif session.phase == "ESTABLISHED":
-                if frame_type != "msg":
-                    raise ProtocolError(f"expected msg in ESTABLISHED, got {frame_type!r}")
-                # 'text' vs 'ct' discriminator: the secure channel carries ONLY
-                # sealed message blocks. A 'text' (plaintext) frame here means
-                # the sender fell out of E2E — kill this session so the client
-                # must re-establish a brand-new secure connection (fresh
-                # handshake, fresh HPKE contexts). Never echo plaintext on /ws.
-                if "text" in frame or "ct" not in frame:
-                    raise ProtocolError("plaintext frame on secure channel — new secure connection required")
-                plaintext = session.handle_msg(frame)
-                reply     = session.seal_reply(b"ECHO: " + plaintext)
-                await websocket.send_text(json.dumps(reply))
-
+        await serve_secure_link(websocket.receive_text, websocket.send_text, SERVER_KEYS, HISTORY)
     except WebSocketDisconnect:
         pass
     except ProtocolError as e:
@@ -116,7 +104,7 @@ async def ws_hpke(websocket: WebSocket):
         except Exception:
             pass
     except Exception as e:
-        print(f"[error] {e}")
+        print(f"[error] {type(e).__name__}")
         try:
             await websocket.close(code=4001, reason="internal error")
         except Exception:
@@ -128,7 +116,7 @@ async def ws_hpke(websocket: WebSocket):
 @app.websocket("/ws/plain")
 async def ws_plain(websocket: WebSocket):
     """
-    Plaintext echo — no HPKE.
+    Plaintext echo — no HPKE, no history.
     mitmproxy sees the prompt in cleartext: demonstrates TLS-alone limitation.
 
     Message blocks mirror the secure channel but use 'text' where /ws uses 'ct':

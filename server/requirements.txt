@@ -17,3 +17,6 @@ cryptography
 pyhpke
 
 
+
+# ADR 212 — sealed history records in Postgres (history_store.py)
+psycopg[binary]>=3.2

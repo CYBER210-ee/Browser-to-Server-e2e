@@ -10,12 +10,15 @@ Key decisions:
   D014 — HPKE owns nonce/counter; no manual nonce handling
   D019 — seq gate: expected_next_seq tracked per direction; teardown on any fault
   D020 — TYPE byte (0x01) bound into AAD; strict state machine (§5.6)
+  D023 — sealed epoch_key (0x04, c2s) / history (0x05, s2c) frames share the
+         per-direction seq; c2s msg plaintext is the structured {text, rec} (§7.5)
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -42,10 +45,16 @@ STATE              = b"echovault"                    # §3.1
 DIR_C2S            = b"c2s"                          # §0 item 4
 DIR_S2C            = b"s2c"                          # §0 item 4
 TYPE_MSG           = b"\x01"                         # §3.0.1
+TYPE_EPOCH_KEY     = b"\x04"                         # §3.0.1 — c2s only (D023)
+TYPE_HISTORY       = b"\x05"                         # §3.0.1 — s2c only (D023)
 
 LABEL_PUBKEY       = b"echovault/pubkey/v1"          # §4.1 — 19 bytes
 LABEL_HELLO        = b"echovault/hello/v1"           # §4.2 — 18 bytes
 LABEL_SERVER_HELLO = b"echovault/server_hello/v1"    # §4.3 — 25 bytes
+
+
+class ProtocolError(Exception):
+    """Any protocol violation — caller MUST tear down the connection."""
 
 
 # ── Encoding helpers (§6) ─────────────────────────────────────────────────────
@@ -110,13 +119,75 @@ def compute_session_id(t_hello: bytes, t_server_hello: bytes) -> bytes:
 
 # ── AAD construction (§3) ─────────────────────────────────────────────────────
 
-def make_aad(direction: bytes, session_id: bytes, seq: int) -> bytes:
+def make_aad(direction: bytes, session_id: bytes, seq: int, frame_type: bytes = TYPE_MSG) -> bytes:
     """
     AAD = STATE(9) ‖ SESSION_ID(16) ‖ DIRECTION(3) ‖ TYPE(1) ‖ SEQ8(8) = 37 bytes (§3.1)
-    Never transmitted — both sides reconstruct independently.
+    Never transmitted — both sides reconstruct independently. TYPE is the code
+    for the frame class expected in the current state (§3.0.1), never the wire string.
     """
     assert len(session_id) == 16, f"SESSION_ID must be 16 bytes, got {len(session_id)}"
-    return STATE + session_id + direction + TYPE_MSG + seq_to_bytes(seq)
+    assert len(frame_type) == 1
+    return STATE + session_id + direction + frame_type + seq_to_bytes(seq)
+
+
+# ── Sealed-plaintext shapes for the history frames (§5.4.1, §7.5) ─────────────
+
+EPOCH_ID_LEN = 16
+ENC_LEN      = 32
+EPOCH_CT_LEN = 48      # sealed 32-byte scalar ‖ 16-byte tag
+
+
+def _field_bytes(obj: dict, name: str, length: int | None = None, min_length: int = 0) -> bytes:
+    """base64url-decode obj[name] and enforce its length; any fault is a ProtocolError."""
+    v = obj.get(name)
+    if not isinstance(v, str) or not v:
+        raise ProtocolError(f"missing field {name}")
+    try:
+        raw = b64url_decode(v)
+    except Exception:
+        raise ProtocolError(f"bad base64url in {name}")
+    if length is not None and len(raw) != length:
+        raise ProtocolError(f"bad length for {name}")
+    if len(raw) < min_length:
+        raise ProtocolError(f"bad length for {name}")
+    return raw
+
+
+def _json_object(pt: bytes) -> dict:
+    try:
+        obj = json.loads(pt.decode("utf-8"))
+    except Exception:
+        raise ProtocolError("sealed plaintext is not UTF-8 JSON")
+    if not isinstance(obj, dict):
+        raise ProtocolError("sealed plaintext is not a JSON object")
+    return obj
+
+
+def parse_msg_plaintext(pt: bytes) -> tuple[str, bytes, bytes, bytes]:
+    """
+    c2s msg plaintext (§7.5): {"text": str, "rec": {"epoch", "enc", "ct"}}.
+    Returns (text, epoch_id, rec_enc, rec_ct). No text-only fallback — a bare
+    string here is a fault, exactly like a plaintext frame on the wire.
+    """
+    obj  = _json_object(pt)
+    text = obj.get("text")
+    rec  = obj.get("rec")
+    if not isinstance(text, str) or not isinstance(rec, dict):
+        raise ProtocolError("msg plaintext is not {text, rec}")
+    epoch_id = _field_bytes(rec, "epoch", EPOCH_ID_LEN)
+    enc      = _field_bytes(rec, "enc", ENC_LEN)
+    ct       = _field_bytes(rec, "ct", min_length=16)
+    return text, epoch_id, enc, ct
+
+
+def parse_epoch_key_plaintext(pt: bytes) -> tuple[bytes, bytes, bytes]:
+    """epoch_key plaintext (§5.4.1): {"epoch", "enc", "ct"} → (epoch_id, enc, ct)."""
+    obj = _json_object(pt)
+    return (
+        _field_bytes(obj, "epoch", EPOCH_ID_LEN),
+        _field_bytes(obj, "enc", ENC_LEN),
+        _field_bytes(obj, "ct", EPOCH_CT_LEN),
+    )
 
 
 # ── Server key management ─────────────────────────────────────────────────────
@@ -186,21 +257,18 @@ def load_server_keys() -> ServerKeys:
 
 # ── Per-connection state machine (§5.6) ───────────────────────────────────────
 
-class ProtocolError(Exception):
-    """Any protocol violation — caller MUST tear down the connection."""
-
-
 @dataclass
 class ServerSession:
     """
     Per-WebSocket state machine.
       AWAIT_HELLO  → accepts only hello
-      ESTABLISHED  → accepts only msg
+      ESTABLISHED  → accepts msg and epoch_key (c2s); emits history once, then msg
     Any wrong frame type or auth/ordering fault → raises ProtocolError.
     Never reuse across connections.
     """
     keys: ServerKeys
     phase: str = "AWAIT_HELLO"
+    owner: bytes = field(default=b"", repr=False)   # browser_ed25519 from hello — files history (§9.4)
 
     _recipient_ctx_c2s: object = field(default=None, repr=False)
     _sender_ctx_s2c:    object = field(default=None, repr=False)
@@ -259,6 +327,7 @@ class ServerSession:
 
         # Compute SESSION_ID — both transcripts now known
         self._session_id = compute_session_id(t_hello, t_server_hello)
+        self.owner = browser_ed25519
         self.phase = "ESTABLISHED"
 
         return {
@@ -268,13 +337,22 @@ class ServerSession:
         }
 
     def handle_msg(self, frame: dict) -> bytes:
+        """Open an incoming msg (§5.4, §7.2): the c2s plaintext of §7.5, still unparsed."""
+        return self._open_frame(frame, TYPE_MSG, "msg")
+
+    def handle_epoch_key(self, frame: dict) -> tuple[bytes, bytes, bytes]:
+        """Open an incoming epoch_key (§5.4.1) → (epoch_id, enc, ct) for the store."""
+        return parse_epoch_key_plaintext(self._open_frame(frame, TYPE_EPOCH_KEY, "epoch_key"))
+
+    def _open_frame(self, frame: dict, frame_type: bytes, label: str) -> bytes:
         """
-        Open incoming msg (§5.4, §7.2).
+        Open any sealed c2s frame. The AAD uses the TYPE for the class this frame
+        routed as — a flipped wire type therefore fails open() (§5.6).
         seq gate enforced before open() — D019/§7.3.
         Raises ProtocolError on any fault; caller MUST tear down.
         """
         if self.phase != "ESTABLISHED":
-            raise ProtocolError(f"msg received in wrong phase: {self.phase}")
+            raise ProtocolError(f"{label} received in wrong phase: {self.phase}")
 
         # Issue 1 fix: validate seq format before parsing
         seq_hex = frame.get("seq", "")
@@ -300,23 +378,36 @@ class ServerSession:
                 f"seq gate: expected {self._expected_c2s:#018x}, got {seq:#018x}"
             )
 
-        aad       = make_aad(DIR_C2S, self._session_id, seq)
-        plaintext = self._recipient_ctx_c2s.open(ct, aad=aad)
+        aad = make_aad(DIR_C2S, self._session_id, seq, frame_type)
+        try:
+            plaintext = self._recipient_ctx_c2s.open(ct, aad=aad)
+        except Exception:
+            raise ProtocolError(f"{label} open() failed")
         self._expected_c2s += 1
         return plaintext
 
     def seal_reply(self, plaintext: bytes) -> dict:
-        """Seal a server→browser reply (§5.4, §7.2). Returns ready-to-send frame dict."""
+        """Seal a server→browser echo (§5.4, §7.2). Returns ready-to-send frame dict."""
+        return self._seal_frame(plaintext, TYPE_MSG, "msg")
+
+    def seal_history(self, history: dict) -> dict:
+        """Seal the one-time history push (§5.4.2). MUST be the first s2c frame (seq 0)."""
+        if self._expected_s2c != 0:
+            raise ProtocolError("history must be the first s2c frame")
+        pt = json.dumps(history, separators=(",", ":")).encode("utf-8")
+        return self._seal_frame(pt, TYPE_HISTORY, "history")
+
+    def _seal_frame(self, plaintext: bytes, frame_type: bytes, wire_type: str) -> dict:
         if self.phase != "ESTABLISHED":
-            raise ProtocolError("seal_reply called outside ESTABLISHED phase")
+            raise ProtocolError(f"seal {wire_type} called outside ESTABLISHED phase")
 
         seq = self._expected_s2c
-        aad = make_aad(DIR_S2C, self._session_id, seq)
+        aad = make_aad(DIR_S2C, self._session_id, seq, frame_type)
         ct  = self._sender_ctx_s2c.seal(plaintext, aad=aad)
         self._expected_s2c += 1
 
         return {
-            "type": "msg",
+            "type": wire_type,
             "seq":  seq_to_hex(seq),
             "ct":   b64url_encode(ct),
         }
