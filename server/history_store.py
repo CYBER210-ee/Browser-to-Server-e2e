@@ -14,6 +14,7 @@ Key decisions:
   D021 — server and database hold opaque blobs only
   D022 — random epoch keys; expiry = key erasure after HISTORY_WINDOW
   D024 — keys on the server host, records in a remote Postgres over verify-full TLS
+  D031 — history is per echo server: records carry server_name and are filtered by it
 """
 
 from __future__ import annotations
@@ -165,11 +166,13 @@ class EpochKeyStore:
 # ── Records: interface + implementations ─────────────────────────────────────
 
 class RecordStore(Protocol):
-    def insert(self, owner: bytes, rec: StoredRecord) -> None: ...
-    def recent(self, owner: bytes, limit: int) -> list[StoredRecord]:
+    """Every call is scoped to one echo server (D031): the shared database holds
+    records for many servers, and a server only ever reads its own."""
+    def insert(self, server: str, owner: bytes, rec: StoredRecord) -> None: ...
+    def recent(self, server: str, owner: bytes, limit: int) -> list[StoredRecord]:
         """Up to `limit` newest records, returned oldest first (§5.4.2)."""
         ...
-    def delete_epoch(self, owner: bytes, epoch_id: bytes) -> int: ...
+    def delete_epoch(self, server: str, owner: bytes, epoch_id: bytes) -> int: ...
     def close(self) -> None: ...
 
 
@@ -177,22 +180,23 @@ class MemoryRecordStore:
     """Non-persistent store for tests and HISTORY_BACKEND=memory dev runs. Same blobs, no disk."""
 
     def __init__(self):
-        self._rows: list[tuple[bytes, StoredRecord]] = []
+        self._rows: list[tuple[str, bytes, StoredRecord]] = []
         self._lock = threading.Lock()
 
-    def insert(self, owner: bytes, rec: StoredRecord) -> None:
+    def insert(self, server: str, owner: bytes, rec: StoredRecord) -> None:
         with self._lock:
-            self._rows.append((owner, rec))
+            self._rows.append((server, owner, rec))
 
-    def recent(self, owner: bytes, limit: int) -> list[StoredRecord]:
+    def recent(self, server: str, owner: bytes, limit: int) -> list[StoredRecord]:
         with self._lock:
-            mine = [r for o, r in self._rows if o == owner]
+            mine = [r for sv, o, r in self._rows if sv == server and o == owner]
         return mine[-limit:] if limit > 0 else []
 
-    def delete_epoch(self, owner: bytes, epoch_id: bytes) -> int:
+    def delete_epoch(self, server: str, owner: bytes, epoch_id: bytes) -> int:
         with self._lock:
             before = len(self._rows)
-            self._rows = [(o, r) for o, r in self._rows if not (o == owner and r.epoch_id == epoch_id)]
+            self._rows = [row for row in self._rows
+                          if not (row[0] == server and row[1] == owner and row[2].epoch_id == epoch_id)]
             return before - len(self._rows)
 
     def close(self) -> None:
@@ -224,37 +228,41 @@ class PostgresRecordStore:
         with self._connect() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS history_records ("
-                "  id BIGSERIAL PRIMARY KEY, owner BYTEA NOT NULL, epoch_id BYTEA NOT NULL,"
-                "  enc BYTEA NOT NULL, ct BYTEA NOT NULL, created_at BIGINT NOT NULL)"
+                "  id BIGSERIAL PRIMARY KEY, server_name TEXT NOT NULL, owner BYTEA NOT NULL,"
+                "  epoch_id BYTEA NOT NULL, enc BYTEA NOT NULL, ct BYTEA NOT NULL,"
+                "  created_at BIGINT NOT NULL)"
             )
             db.execute(
-                "CREATE INDEX IF NOT EXISTS history_records_owner_idx ON history_records (owner, id)"
+                "CREATE INDEX IF NOT EXISTS history_records_server_owner_idx"
+                " ON history_records (server_name, owner, id)"
             )
 
     def _connect(self):
         return self._psycopg.connect(self._conninfo, autocommit=True)
 
-    def insert(self, owner: bytes, rec: StoredRecord) -> None:
+    def insert(self, server: str, owner: bytes, rec: StoredRecord) -> None:
         with self._connect() as db:
             db.execute(
-                "INSERT INTO history_records (owner, epoch_id, enc, ct, created_at) VALUES (%s,%s,%s,%s,%s)",
-                (owner, rec.epoch_id, rec.enc, rec.ct, rec.created_at),
+                "INSERT INTO history_records (server_name, owner, epoch_id, enc, ct, created_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s)",
+                (server, owner, rec.epoch_id, rec.enc, rec.ct, rec.created_at),
             )
 
-    def recent(self, owner: bytes, limit: int) -> list[StoredRecord]:
+    def recent(self, server: str, owner: bytes, limit: int) -> list[StoredRecord]:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT epoch_id, enc, ct, created_at FROM ("
                 "  SELECT id, epoch_id, enc, ct, created_at FROM history_records"
-                "  WHERE owner=%s ORDER BY id DESC LIMIT %s) newest ORDER BY id ASC",
-                (owner, limit),
+                "  WHERE server_name=%s AND owner=%s ORDER BY id DESC LIMIT %s) newest ORDER BY id ASC",
+                (server, owner, limit),
             ).fetchall()
         return [StoredRecord(bytes(r[0]), bytes(r[1]), bytes(r[2]), int(r[3])) for r in rows]
 
-    def delete_epoch(self, owner: bytes, epoch_id: bytes) -> int:
+    def delete_epoch(self, server: str, owner: bytes, epoch_id: bytes) -> int:
         with self._connect() as db:
             cur = db.execute(
-                "DELETE FROM history_records WHERE owner=%s AND epoch_id=%s", (owner, epoch_id)
+                "DELETE FROM history_records WHERE server_name=%s AND owner=%s AND epoch_id=%s",
+                (server, owner, epoch_id),
             )
             return cur.rowcount
 
@@ -270,10 +278,12 @@ class HistoryService:
     a slow remote Postgres never stalls the WebSocket loop.
     """
 
-    def __init__(self, epochs: EpochKeyStore, records: RecordStore, policy: Policy):
+    def __init__(self, epochs: EpochKeyStore, records: RecordStore, policy: Policy,
+                 server_name: str = "echovault"):
         self.epochs  = epochs
         self.records = records
         self.policy  = policy
+        self.server  = server_name          # D031: this server's records only
 
     @staticmethod
     def now() -> int:
@@ -284,7 +294,7 @@ class HistoryService:
         now = self.now() if now is None else now
         erased = await asyncio.to_thread(self.epochs.erase_expired, now, self.policy.window_s)
         for owner, epoch_id in erased:
-            await asyncio.to_thread(self.records.delete_epoch, owner, epoch_id)
+            await asyncio.to_thread(self.records.delete_epoch, self.server, owner, epoch_id)
         return len(erased)
 
     async def add_epoch_key(self, owner: bytes, epoch_id: bytes, enc: bytes, ct: bytes) -> None:
@@ -296,13 +306,13 @@ class HistoryService:
 
     async def add_record(self, owner: bytes, epoch_id: bytes, enc: bytes, ct: bytes) -> None:
         rec = StoredRecord(epoch_id, enc, ct, self.now())
-        await asyncio.to_thread(self.records.insert, owner, rec)
+        await asyncio.to_thread(self.records.insert, self.server, owner, rec)
 
     async def history_for(self, owner: bytes) -> dict:
         """The history-push plaintext (§5.4.2): policy + live epochs + recent records."""
         await self.sweep()
         epochs  = await asyncio.to_thread(self.epochs.live, owner)
-        records = await asyncio.to_thread(self.records.recent, owner, self.policy.max_records)
+        records = await asyncio.to_thread(self.records.recent, self.server, owner, self.policy.max_records)
         return {
             "policy":  self.policy.as_wire(),
             "epochs":  [e.as_wire() for e in epochs],
@@ -323,9 +333,9 @@ class HistoryService:
         self.records.close()
 
 
-def open_history_service() -> HistoryService:
+def open_history_service(server_name: str = "echovault") -> HistoryService:
     """
-    Build the service from the environment:
+    Build the service for one named echo server (D031) from the environment:
       EPOCH_DB_PATH     SQLite file for sealed epoch keys (default ./epoch_keys.sqlite3)
       HISTORY_BACKEND   'postgres' (default) or 'memory' (dev only — nothing persists)
       DATABASE_URL      postgresql://…?sslmode=verify-full&sslrootcert=… (postgres backend)
@@ -344,4 +354,4 @@ def open_history_service() -> HistoryService:
         records = PostgresRecordStore(dsn, os.environ.get("DB_SSLROOTCERT") or None)
     else:
         raise RuntimeError(f"unknown HISTORY_BACKEND {backend!r}")
-    return HistoryService(epochs, records, policy)
+    return HistoryService(epochs, records, policy, server_name)

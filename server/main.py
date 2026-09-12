@@ -7,11 +7,14 @@ Endpoints:
   GET /pubkey       → {server_ed25519, sig}  (§5.1, D028 — pin confirmation only)
   GET /api/pubkey   → alias (backward compat)
   WS  /ws           → HPKE echo + stored history, strict state machine (§5.6)
-  WS  /ws/plain     → plaintext echo — demo exhibit (b): E2E OFF, no history
+
+There is no plaintext endpoint (D029) and no plain-HTTP listener: run under
+uvicorn with --ssl-keyfile/--ssl-certfile (D030, see server/certs/).
 """
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +30,9 @@ from secure_link import serve_secure_link
 load_dotenv()
 
 SERVER_KEYS: ServerKeys = load_server_keys()
+# This server's name (D031): its TLS cert name, and what its records are filed
+# under in the shared database. Inert with one server; the seam for many.
+SERVER_NAME: str = os.environ.get("SERVER_NAME", "echovault").strip() or "echovault"
 HISTORY: HistoryService | None = None
 
 
@@ -35,7 +41,7 @@ async def lifespan(app: FastAPI):
     # Stores open at startup (fail loudly if the DB is misconfigured — D024) and
     # the sweeper erases expired epoch keys on a timer as well as per connection.
     global HISTORY
-    HISTORY = open_history_service()
+    HISTORY = open_history_service(SERVER_NAME)
     # The out-of-band pin (§4.1.1): read it off this console, never off the wire.
     print(f"[echovault] server pin (Ed25519, base64url): {b64url_encode(SERVER_KEYS.ed25519_pub_bytes)}")
     sweeper = asyncio.create_task(HISTORY.run_sweeper())
@@ -60,7 +66,7 @@ async def get_health():
 @app.get("/api/status")
 async def get_status():
     return JSONResponse(status_code=200, content={
-        "status": "online", "websocket_route": "/ws"
+        "status": "online", "websocket_route": "/ws", "server": SERVER_NAME,
     })
 
 
@@ -110,55 +116,3 @@ async def ws_hpke(websocket: WebSocket):
             await websocket.close(code=4001, reason="internal error")
         except Exception:
             pass
-
-
-# ── WebSocket: plaintext echo — demo exhibit (b): E2E OFF ─────────────────────
-
-@app.websocket("/ws/plain")
-async def ws_plain(websocket: WebSocket):
-    """
-    Plaintext echo — no HPKE, no history.
-    mitmproxy sees the prompt in cleartext: demonstrates TLS-alone limitation.
-
-    Message blocks mirror the secure channel but use 'text' where /ws uses 'ct':
-      client → {"type":"msg", "seq": N, "text": "..."}
-      server → {"type":"msg", "seq": N, "text": "ECHO: ...", "plaintext": true}
-
-    Invariants:
-      * A frame carrying 'ct' (or missing 'text') is rejected — close 4002.
-        Sealed traffic belongs on /ws only; this keeps the two modes disjoint.
-      * An echo is emitted ONLY in direct response to a received plaintext
-        transmit (transmits_seen gate) — the server never originates a
-        plaintext echo the client didn't ask for.
-    """
-    await websocket.accept()
-    transmits_seen = 0
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                frame = json.loads(raw)
-            except Exception:
-                await websocket.close(code=4002, reason="malformed frame: expected JSON message block")
-                return
-            if (
-                not isinstance(frame, dict)
-                or frame.get("type") != "msg"
-                or "ct" in frame
-                or not isinstance(frame.get("text"), str)
-            ):
-                await websocket.close(code=4002, reason="plain endpoint accepts only 'text' message blocks")
-                return
-
-            transmits_seen += 1
-            if transmits_seen < 1:
-                # Defensive: no plaintext echo may leave without a transmit first.
-                continue
-            await websocket.send_text(json.dumps({
-                "type": "msg",
-                "seq": frame.get("seq", 0),
-                "text": f"ECHO: {frame['text']}",
-                "plaintext": True,
-            }))
-    except WebSocketDisconnect:
-        pass
