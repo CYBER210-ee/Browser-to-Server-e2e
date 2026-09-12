@@ -167,21 +167,6 @@ body {
 }
 .cg-text {}
 
-/* ---- Plaintext ('text' message blocks, E2E OFF) — highlighted RED so the
-   transcript makes unencrypted traffic impossible to miss. Sealed 'ct'
-   blocks keep the normal bubble styling. ---- */
-.cg-bubble.plain,
-.cg-row.user .cg-bubble.plain,
-.cg-row.assistant .cg-bubble.plain {
-  background: rgba(231, 76, 60, .10);
-  border: 1px solid #e74c3c;
-  box-shadow: 0 0 8px -2px rgba(231, 76, 60, .55);
-}
-.cg-text.plain { color: #e74c3c; font-weight: 500; }
-.cg-plain-badge {
-  font-size: 10px; font-weight: 700; letter-spacing: .6px;
-  text-transform: uppercase; color: #e74c3c; margin-bottom: 4px;
-}
 /* Messages that came back in the history push (ADR 212) — read-only replay. */
 .cg-restored-badge {
   font-size: 10px; font-weight: 700; letter-spacing: .6px;
@@ -342,38 +327,8 @@ body {
 .cg-id-hint { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); }
 
 /* ============================================================================
- * ENCRYPT TOGGLE (header switch on the chat page) + header action row
+ * HEADER ACTION ROW
  * ========================================================================== */
 
-/* Holds the toggle and the Mnemonic button together on the right of the header. */
+/* Holds the Key Vault button on the right of the header. */
 .cg-header-actions { display: flex; align-items: center; gap: 14px; }
-
-/* The toggle is a <label> wrapping a hidden checkbox + a sliding track. */
-.cg-toggle {
-  display: inline-flex; align-items: center; gap: 8px;
-  cursor: pointer; user-select: none;
-  font-size: 12.5px; font-weight: 600; color: var(--text);
-}
-/* Hide the real checkbox but keep it accessible/clickable. */
-.cg-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
-
-.cg-toggle-track {
-  position: relative; width: 38px; height: 22px; border-radius: 999px;
-  background: #3a3a42; border: 1px solid rgba(255,255,255,.12);
-  transition: background .18s;
-}
-.cg-toggle-thumb {
-  position: absolute; top: 2px; left: 2px;
-  width: 16px; height: 16px; border-radius: 50%;
-  background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.5);
-  transition: transform .18s;
-}
-/* Checked (Encrypt ON) → green track, thumb slides right. */
-.cg-toggle input:checked + .cg-toggle-track {
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-}
-.cg-toggle input:checked + .cg-toggle-track .cg-toggle-thumb { transform: translateX(16px); }
-.cg-toggle input:focus-visible + .cg-toggle-track { box-shadow: 0 0 0 3px rgba(16,163,127,.3); }
-
-/* The "On" / "Off" word next to the switch. */
-.cg-toggle-state { min-width: 22px; color: var(--muted); }

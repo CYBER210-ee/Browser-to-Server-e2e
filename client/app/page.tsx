@@ -15,9 +15,10 @@
  *      ephemeral, and only then runs hello / server_hello (§4.2–§4.3). Both
  *      directions seal to keys that die with the connection: a recording of
  *      the wire cannot be opened with anything that survives it.
- *   4) When Encrypt is ON, every message you send is sealed in the browser
- *      (HPKE, ChaCha20-Poly1305) and every echo is opened in the browser —
- *      a TLS-terminating proxy sees only { type, seq, ct }.
+ *   4) Every message you send is sealed in the browser (HPKE,
+ *      ChaCha20-Poly1305) and every echo is opened in the browser — a
+ *      TLS-terminating proxy sees only { type, seq, ct }. There is no
+ *      plaintext mode (D029).
  *   5) Stored history (ADR 212, protocol.md §9). Each prompt is ALSO sealed to
  *      a random per-epoch key before it leaves the page and rides inside the
  *      sealed msg; the epoch key itself is sealed to your identity key and
@@ -229,23 +230,15 @@ type Sender = 'user' | 'assistant';
 interface ChatMessage {
   id: number;         // render identity — unique for the page's lifetime.
                       // seq is NOT usable as a React key: it resets to 0 on
-                      // every new session (plain↔secure switches, re-handshakes).
+                      // every new session (re-handshakes).
   seq: number;        // a counter/ID number for ordering messages (0, 1, 2, ...)
   text: string;       // the actual words of the message
   type: string;       // a label for the kind of message (e.g. 'msg')
   sender: Sender;     // who sent it: 'user' or 'assistant'
   timestamp: string;  // a human-readable time, e.g. "3:42:10 PM"
-  encrypted: boolean; // wire framing: true → sealed {ct} block; false → {text}
-                      // plaintext block, rendered in RED in the transcript
   restored?: boolean; // came back in the history push (§5.4.2), not typed now;
                       // echoes are rebuilt from the stored prompt (D025)
 }
-
-// Which wire mode the CURRENT WebSocket speaks:
-//   'secure' → /ws       (HPKE, message blocks carry 'ct')
-//   'plain'  → /ws/plain (E2E OFF,  message blocks carry 'text')
-//   'none'   → no live socket
-type WireMode = 'secure' | 'plain' | 'none';
 
 // Traffic-light states for the server-key check.
 type PinStatus = 'unchecked' | 'valid' | 'invalid';
@@ -271,16 +264,6 @@ export default function ChatApp() {
   const c2sSeq = useRef<number>(0);
   const lastS2C = useRef<number>(-1);
 
-  // Which protocol the live socket speaks (see WireMode above). Plaintext
-  // frames are ONLY legal while this is 'plain'; on the secure channel a
-  // 'text' frame is a fault that forces a brand-new secure connection.
-  const wireMode = useRef<WireMode>('none');
-
-  // Echo-gate for plaintext mode: number of plaintext transmits still
-  // awaiting their echo. A plaintext echo that arrives when this is 0 was
-  // NOT preceded by a plaintext transmit → it is dropped, never rendered.
-  const plainPending = useRef<number>(0);
-
   // Monotonic id for React keys — never resets, unlike the per-session seq.
   const nextMsgId = useRef<number>(0);
 
@@ -298,7 +281,6 @@ export default function ChatApp() {
   const [pinStatus, setPinStatus] = useState<PinStatus>('unchecked');
   const [hasSavedMnemonic, setHasSavedMnemonic] = useState(false);
   const [channelEstablished, setEncChannel] = useState(false);
-  const [encrypt, setEncrypt] = useState(true);
   const [statusNote, setStatusNote] = useState('');
 
   // The mnemonic itself, loaded from the Identity page's saved variable.
@@ -385,8 +367,6 @@ export default function ChatApp() {
     link.current.awaitingHistory = false;
     c2sSeq.current = 0;
     lastS2C.current = -1;
-    wireMode.current = 'none';
-    plainPending.current = 0;
     setEncChannel(false);
     setIsConnected(false);
     setIsTyping(false);
@@ -394,13 +374,12 @@ export default function ChatApp() {
   };
 
   /* -------------------- server base URLs (HTTP + WS) -------------------- */
-// One env var, HTTP-flavored. For your mitmproxy setup:
-//   NEXT_PUBLIC_API_URL=https://echo.server.test
+// One env var, HTTP-flavored. The echo server always speaks TLS itself
+// (D030), so the default is the local server's https port; in the cloud it is
+// the reverse proxy's public name for the server you picked.
+//   NEXT_PUBLIC_API_URL=https://localhost:8443
 const httpBase =
-  process.env.NEXT_PUBLIC_API_URL ??
-  (typeof window !== 'undefined' && window.location.protocol === 'https:'
-    ? `https://${window.location.host}`
-    : 'http://localhost:8000');
+  process.env.NEXT_PUBLIC_API_URL ?? 'https://localhost:8443';
 
 // The WS base is DERIVED: https→wss, http→ws. Same host, same TLS decision.
 const wsBase =
@@ -490,7 +469,6 @@ const wsBase =
 
     const ws = new WebSocket(`${wsBase}/ws`);
     socketRef.current = ws;
-    wireMode.current = 'secure';
     link.current.awaitingServerKey = true;
 
     ws.onopen = () => {
@@ -498,76 +476,18 @@ const wsBase =
       setStatusNote('Connected — waiting for the server\u2019s connection key…');
     };
     ws.onerror = () => teardown('Connection error.');
-    ws.onclose = (event) => {
+    ws.onclose = () => {
       if (socketRef.current !== ws) return;
       setIsConnected(false);
       setEncChannel(false);
-      // Server detected plaintext on the secure channel (close 4001 with a
-      // "plaintext..." reason): the old session is dead by design. Validate
-      // the requirement by RE-ESTABLISHING a brand-new secure connection —
-      // full pin re-verify + fresh handshake, never a resumed session.
-      if (event.code === 4001 && /plaintext/i.test(event.reason)) {
-        teardown('Plaintext detected on secure channel — re-establishing a NEW secure connection…');
-        void handleVerify();
-      }
     };
     ws.onmessage = (event) => {
-      handleFrame(event.data as string).catch((err: unknown) => {
-        if (err instanceof Error && err.message === 'PLAINTEXT_ON_SECURE') {
-          // A plaintext echo showed up on the encrypted channel: never render
-          // it; tear down and re-establish a new secure connection.
-          teardown('Plaintext frame on secure channel — re-establishing a NEW secure connection…');
-          void handleVerify();
-          return;
-        }
+      // Any fault — bad signature, wrong counter, tampered ciphertext,
+      // unexpected frame — abandons the whole channel (§7.3/§7.4).
+      handleFrame(event.data as string).catch(() => {
         teardown('Encrypted channel fault — torn down. Verify again to reconnect.');
       });
     };
-  };
-
-  /* ---------------- PLAINTEXT MODE (E2E OFF, /ws/plain) ------------------ */
-  // Deliberately mirrors establishChannel but with NO crypto: message blocks
-  // carry 'text' instead of 'ct', and every frame is rendered in RED. Used
-  // for the mitmproxy comparison exhibit. Any secure-session material is
-  // wiped first (teardown) so plaintext use can never touch HPKE state.
-  const connectPlain = () => {
-    teardown('');
-    const ws = new WebSocket(`${wsBase}/ws/plain`);
-    socketRef.current = ws;
-    wireMode.current = 'plain';
-
-    ws.onopen = () => {
-      setIsConnected(true);
-      setStatusNote('⚠ PLAINTEXT mode — messages are NOT end-to-end encrypted (TLS only).');
-    };
-    ws.onerror = () => teardown('Connection error.');
-    ws.onclose = () => {
-      if (socketRef.current === ws) {
-        setIsConnected(false);
-        wireMode.current = 'none';
-      }
-    };
-    ws.onmessage = (event) => {
-      handleFrame(event.data as string).catch(() =>
-        teardown('Plaintext channel fault — connection closed.'),
-      );
-    };
-  };
-
-  /* ----------------------- ENCRYPT TOGGLE HANDLER ------------------------ */
-  // OFF → drop the secure channel entirely and speak plaintext on /ws/plain.
-  // ON  → plaintext was (or may have been) used in between, so the previous
-  //       secure session is treated as burned: run the FULL Verify + handshake
-  //       again and mint a brand-new secure connection (new enc, new session
-  //       id, counters back to 0). We never resume across a plaintext gap.
-  const handleEncryptToggle = async (checked: boolean) => {
-    setEncrypt(checked);
-    if (!checked) {
-      connectPlain();
-    } else {
-      teardown('Re-establishing a new secure connection after plaintext use…');
-      await handleVerify();
-    }
   };
 
   /* --------------- INCOMING FRAMES (handshake + sealed msgs) ------------- */
@@ -578,35 +498,6 @@ const wsBase =
 
     // The server's uniform rejection — it already tore the link down.
     if (data.type === 'error') throw new Error('server rejected');
-
-    // ------------------- PLAINTEXT MODE (/ws/plain) ------------------------
-    // Message blocks here carry 'text' (never 'ct'). Two gates:
-    //   1. a 'ct' frame on the plain channel is a protocol mix-up → fault;
-    //   2. a plaintext echo is accepted ONLY if a plaintext transmit is
-    //      still outstanding (plainPending > 0) — an unsolicited plaintext
-    //      echo is dropped and never reaches the transcript.
-    if (wireMode.current === 'plain') {
-      if (data.type !== 'msg' || typeof data.text !== 'string' || typeof data.ct === 'string')
-        throw new Error('bad plaintext frame');
-      if (plainPending.current <= 0) {
-        setStatusNote('Dropped unsolicited plaintext echo (no plaintext transmit outstanding).');
-        return;
-      }
-      plainPending.current -= 1;
-      setIsTyping(false);
-      const incoming: ChatMessage = {
-        id: nextMsgId.current++,
-        seq: typeof data.seq === 'number' ? data.seq : lastS2C.current + 1,
-        text: data.text,
-        type: 'msg',
-        sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString(),
-        encrypted: false,           // → rendered RED in the transcript
-      };
-      lastS2C.current = incoming.seq;
-      setMessages((prev) => [...prev, incoming]);
-      return;
-    }
 
     // ---------- AWAIT_SERVER_KEY: the server's fresh key (§4.0.1) ----------
     if (L.awaitingServerKey) {
@@ -700,44 +591,38 @@ const wsBase =
     }
 
     // ----------------------- established: sealed msg -----------------------
-    if (data.type !== 'msg') throw new Error('wrong frame for phase');
+    // Only a sealed {type, seq, ct} block is legal here. Anything else — a
+    // 'text' field, a missing ct — is a fault: there is no plaintext mode.
+    if (data.type !== 'msg' || typeof data.ct !== 'string' || 'text' in data)
+      throw new Error('wrong frame for phase');
 
     setIsTyping(false);
 
-    if (typeof data.ct === 'string') {
-      // ENCRYPTED echo. The counter must be EXACTLY the next one (16-char
-      // lowercase hex). Anything else — repeat, gap, garbage — is a fault.
-      if (typeof data.seq !== 'string' || !/^[0-9a-f]{16}$/.test(data.seq))
-        throw new Error('malformed seq');
-      const seq = parseInt(data.seq, 16);
-      if (seq !== lastS2C.current + 1) throw new Error('seq gate');
+    // The counter must be EXACTLY the next one (16-char lowercase hex).
+    // Anything else — repeat, gap, garbage — is a fault.
+    if (typeof data.seq !== 'string' || !/^[0-9a-f]{16}$/.test(data.seq))
+      throw new Error('malformed seq');
+    const seq = parseInt(data.seq, 16);
+    if (seq !== lastS2C.current + 1) throw new Error('seq gate');
 
-      // Rebuild the authentication label from what WE know and open the
-      // ciphertext. Wrong session, direction, type, counter, or a single
-      // flipped bit → open() throws → teardown (caught by the caller).
-      const ct = unb64u(data.ct, -1);
-      if (ct.length < 16) throw new Error('bad ct');
-      const aad = buildAad(L.sessionId!, DIR_S2C, seq);
-      const pt = await L.recipient.open(ab(ct), ab(aad));
-      lastS2C.current = seq;
+    // Rebuild the authentication label from what WE know and open the
+    // ciphertext. Wrong session, direction, type, counter, or a single
+    // flipped bit → open() throws → teardown (caught by the caller).
+    const ct = unb64u(data.ct, -1);
+    if (ct.length < 16) throw new Error('bad ct');
+    const aad = buildAad(L.sessionId!, DIR_S2C, seq);
+    const pt = await L.recipient.open(ab(ct), ab(aad));
+    lastS2C.current = seq;
 
-      const incoming: ChatMessage = {
-        id: nextMsgId.current++,
-        seq,
-        text: new TextDecoder().decode(pt),
-        type: 'msg',
-        sender: 'assistant',
-        timestamp: new Date().toLocaleTimeString(),
-        encrypted: true,            // sealed 'ct' block — normal styling
-      };
-      setMessages((prev) => [...prev, incoming]);
-      return;
-    }
-
-    // A 'text' (plaintext) message block on the SECURE channel. This replaces
-    // the old permissive legacy path: plaintext is never rendered here, and
-    // the fault forces a brand-new secure connection (see ws.onmessage catch).
-    throw new Error('PLAINTEXT_ON_SECURE');
+    const incoming: ChatMessage = {
+      id: nextMsgId.current++,
+      seq,
+      text: new TextDecoder().decode(pt),
+      type: 'msg',
+      sender: 'assistant',
+      timestamp: new Date().toLocaleTimeString(),
+    };
+    setMessages((prev) => [...prev, incoming]);
   };
 
   /* --------------------------- STORED HISTORY ---------------------------- */
@@ -793,11 +678,11 @@ const wsBase =
       const when = new Date(ts).toLocaleString();
       restored.push({
         id: nextMsgId.current++, seq: -1, text, type: 'msg', sender: 'user',
-        timestamp: when, encrypted: true, restored: true,
+        timestamp: when, restored: true,
       });
       restored.push({
         id: nextMsgId.current++, seq: -1, text: `ECHO: ${text}`, type: 'msg', sender: 'assistant',
-        timestamp: when, encrypted: true, restored: true,
+        timestamp: when, restored: true,
       });
     }
     setMessages(restored);
@@ -849,13 +734,17 @@ const wsBase =
       return;
     }
 
-    const sendingEncrypted =
-      wireMode.current === 'secure' && encrypt && channelEstablished &&
-      !!link.current.sender && !!link.current.sessionId && !!link.current.policy;
+    const ready =
+      channelEstablished && !!link.current.sender && !!link.current.sessionId &&
+      !!link.current.policy;
+    if (!ready) {
+      // Fail closed: there is no plaintext path to fall back to (D029).
+      setStatusNote('Channel not ready — press Verify to reconnect.');
+      return;
+    }
 
     // What we show in OUR OWN transcript (always the readable words — it's our
-    // message; encryption only changes what goes over the wire). The
-    // 'encrypted' flag drives the RED plaintext highlight.
+    // message; encryption only changes what goes over the wire).
     const localEcho: ChatMessage = {
       id: nextMsgId.current++,
       seq: c2sSeq.current,
@@ -863,12 +752,11 @@ const wsBase =
       type: 'msg',
       sender: 'user',
       timestamp: new Date().toLocaleTimeString(),
-      encrypted: sendingEncrypted,
     };
 
     try {
-      if (sendingEncrypted) {
-        // ENCRYPTED path. First make sure an epoch key is live (this may send
+      {
+        // First make sure an epoch key is live (this may send
         // an `epoch_key` frame and tick the counter). Then seal the prompt to
         // the epoch key for storage (§9.3), wrap words + record into the §7.5
         // plaintext, build the authentication label for "browser→server, msg,
@@ -893,19 +781,6 @@ const wsBase =
           seq: currentSeq.toString(16).padStart(16, '0'),
           ct: b64u(ct),
         }));
-      } else if (wireMode.current === 'plain') {
-        // PLAINTEXT path (E2E OFF, /ws/plain only) — the TLS-only comparison
-        // mode from the threat model. The message block carries 'text' where
-        // the secure channel carries 'ct'. Registering the transmit in
-        // plainPending is what LICENSES the matching echo: without it the
-        // incoming plaintext echo would be dropped by handleFrame.
-        ws.send(JSON.stringify({ type: 'msg', seq: c2sSeq.current, text }));
-        plainPending.current += 1;
-      } else {
-        // Mode mismatch (e.g. Encrypt is ON but the channel is not
-        // established). Fail closed: never silently downgrade to plaintext.
-        setStatusNote('Channel not ready — toggle Encrypt or press Verify to reconnect.');
-        return;
       }
     } catch {
       teardown('Failed to seal message — channel torn down.');
@@ -972,21 +847,6 @@ const wsBase =
             </div>
           </div>
           <div className="cg-header-actions">
-            {/* The Encrypt switch. OFF drops to the plaintext demo channel
-                (/ws/plain); switching back ON always re-runs Verify and mints
-                a brand-new secure connection — a session that saw plaintext
-                in between is never resumed. */}
-            <label className="cg-toggle" title="Toggle browser-side HPKE encryption">
-              <span>Encrypt</span>
-              <input
-                type="checkbox"
-                checked={encrypt}
-                onChange={(e) => { void handleEncryptToggle(e.target.checked); }}
-              />
-              <span className="cg-toggle-track"><span className="cg-toggle-thumb" /></span>
-              <span className="cg-toggle-state">{encrypt ? 'On' : 'Off'}</span>
-            </label>
-
             <a className="cg-mnemonic-btn" href="/identity">Key Vault</a>
           </div>
         </header>
@@ -1093,16 +953,11 @@ const wsBase =
                 )}
               </div>
 
-              {/* Plaintext ('text') message blocks get the red treatment so a
-                  glance at the transcript shows what was NOT encrypted. */}
-              <div className={`cg-bubble${msg.encrypted ? '' : ' plain'}`}>
-                {!msg.encrypted && (
-                  <div className="cg-plain-badge">⚠ plaintext — not encrypted</div>
-                )}
+              <div className="cg-bubble">
                 {msg.restored && (
                   <div className="cg-restored-badge">restored from history</div>
                 )}
-                <div className={`cg-text${msg.encrypted ? '' : ' plain'}`}>{msg.text}</div>
+                <div className="cg-text">{msg.text}</div>
                 <div className="cg-time">{msg.timestamp}</div>
               </div>
             </div>
