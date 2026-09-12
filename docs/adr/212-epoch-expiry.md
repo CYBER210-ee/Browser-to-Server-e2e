@@ -70,11 +70,11 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
 - [x] Mirror server files (incl. new `secure_link.py`, `history_store.py`) into `echovault-deploy/echo_server/`
 
 ### 4. Client (`client/app/page.tsx`)
-- [ ] Epoch keypair minting, sealing epoch private key to the identity key, `epoch_key` upload
-- [ ] Seal each prompt to the epoch public key; send structured plaintext
-- [ ] `AWAIT_HISTORY` state; open epoch keys, open records, render restored messages and
+- [x] Epoch keypair minting, sealing epoch private key to the identity key, `epoch_key` upload
+- [x] Seal each prompt to the epoch public key; send structured plaintext
+- [x] `AWAIT_HISTORY` state; open epoch keys, open records, render restored messages and
       reconstructed echoes above the live transcript
-- [ ] Wipe epoch keys and history state on teardown
+- [x] Wipe epoch keys and history state on teardown
 
 ### 5. Database container and deploy
 - [ ] `echovault-deploy/echo_db/`: Postgres compose, TLS-only config + scram, cert generation
@@ -88,7 +88,7 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
       `DATABASE_URL` is set, fake otherwise)
 - [x] pytest: full handshake + `history` push + `epoch_key` + structured `msg` with a
       Python-side browser (pyhpke both sides); fail-closed gates
-- [ ] `npm run lint` and `npm run build` in `client/`
+- [x] `npm run lint` and `npm run build` in `client/`
 
 ### 7. Delivery
 - [ ] Initial PR opened for manual review; follow-up PRs for fixes

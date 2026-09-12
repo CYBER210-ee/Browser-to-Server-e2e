@@ -182,6 +182,11 @@ body {
   font-size: 10px; font-weight: 700; letter-spacing: .6px;
   text-transform: uppercase; color: #e74c3c; margin-bottom: 4px;
 }
+/* Messages that came back in the history push (ADR 212) — read-only replay. */
+.cg-restored-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: .6px;
+  text-transform: uppercase; opacity: .55; margin-bottom: 4px;
+}
 
 .cg-time {
   margin-top: 5px; font-size: 10.5px; opacity: .6;

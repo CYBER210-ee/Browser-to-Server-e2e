@@ -15,6 +15,12 @@
  *   4) When Encrypt is ON, every message you send is sealed in the browser
  *      (HPKE, ChaCha20-Poly1305) and every echo is opened in the browser —
  *      a TLS-terminating proxy sees only { type, seq, ct }.
+ *   5) Stored history (ADR 212, protocol.md §9). Each prompt is ALSO sealed to
+ *      a random per-epoch key before it leaves the page and rides inside the
+ *      sealed msg; the epoch key itself is sealed to your identity key and
+ *      uploaded once. The server files blobs it cannot open and pushes them
+ *      back right after the handshake — same 24 words, same history, on any
+ *      browser. Expiry is the server erasing the epoch key after the window.
  *
  * Extra npm packages this page needs (on top of the original):
  *   npm i @scure/bip39 @noble/hashes @noble/curves \
@@ -54,6 +60,13 @@ const AAD_STATE = te.encode("echovault");
 const DIR_C2S = te.encode("c2s"); // browser → server
 const DIR_S2C = te.encode("s2c"); // server → browser
 const TYPE_MSG = new Uint8Array([0x01]);
+const TYPE_EPOCH_KEY = new Uint8Array([0x04]);   // c2s only (§3.0.1, D023)
+const TYPE_HISTORY = new Uint8Array([0x05]);     // s2c only
+// Storage seals (§9): distinct info strings keep a stored blob from ever being
+// confused with a channel frame. Neither is derived from the mnemonic tree.
+const INFO_EPOCH_KEY = te.encode("echovault/epoch-key/v1");
+const INFO_RECORD = te.encode("echovault/record/v1");
+const EPOCH_ID_LEN = 16;
 
 // The HPKE cipher suite: X25519 key agreement + SHA-256 KDF + ChaCha20-Poly1305.
 const suite = new CipherSuite({
@@ -123,9 +136,55 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 // The 37-byte authentication label sealed into every message (protocol §3.1):
 // app name ‖ session fingerprint ‖ direction ‖ frame type ‖ counter.
-function buildAad(sessionId: Uint8Array, dir: Uint8Array, seq: number): Uint8Array {
-  return concatBytes(AAD_STATE, sessionId, dir, TYPE_MSG, seqToBytes8(seq));
+function buildAad(
+  sessionId: Uint8Array, dir: Uint8Array, seq: number, type: Uint8Array = TYPE_MSG,
+): Uint8Array {
+  return concatBytes(AAD_STATE, sessionId, dir, type, seqToBytes8(seq));
 }
+
+/* ----------------------------------------------------------------------------
+ * STORAGE SEALS — protocol.md §9. Every stored blob is an HPKE single-shot
+ * seal (one context, one message) so HPKE keeps owning the nonce (D014).
+ * -------------------------------------------------------------------------- */
+interface SealedBlob { enc: Uint8Array; ct: Uint8Array }
+
+// The storage AAD binds owner ‖ epoch (§9.4): a blob copied to another owner or
+// re-filed under another epoch fails open().
+function storageAad(ownerEd: Uint8Array, epochId: Uint8Array): Uint8Array {
+  return concatBytes(ownerEd, epochId);
+}
+
+async function sealTo(
+  recipientPub: Uint8Array, plaintext: Uint8Array, info: Uint8Array, aad: Uint8Array,
+): Promise<SealedBlob> {
+  const pk = await suite.kem.importKey("raw", ab(recipientPub), true);
+  const ctx = await suite.createSenderContext({ recipientPublicKey: pk, info: ab(info) });
+  const ct = new Uint8Array(await ctx.seal(ab(plaintext), ab(aad)));
+  return { enc: new Uint8Array(ctx.enc), ct };
+}
+
+async function openFrom(
+  recipientScalar: Uint8Array, blob: SealedBlob, info: Uint8Array, aad: Uint8Array,
+): Promise<Uint8Array> {
+  const sk = await suite.kem.importKey("raw", ab(recipientScalar), false);
+  const ctx = await suite.createRecipientContext({
+    recipientKey: sk, enc: ab(blob.enc), info: ab(info),
+  });
+  return new Uint8Array(await ctx.open(ab(blob.ct), ab(aad)));
+}
+
+// An epoch (§9.1): a RANDOM X25519 keypair + random id. Random on purpose —
+// anything derived from the mnemonic could be re-derived forever and so could
+// never expire. The scalar lives in memory for the session and, sealed to the
+// identity key, on the server host until the server erases it.
+interface Epoch {
+  id: Uint8Array;        // 16 bytes
+  scalar: Uint8Array;    // X25519 private key (opens records of this epoch)
+  pub: Uint8Array;       // X25519 public key (records are sealed TO this)
+  createdAt: number;     // UNIX seconds — server clock once uploaded
+}
+
+interface HistoryPolicy { epochLengthS: number; windowS: number }
 
 /* ----------------------------------------------------------------------------
  * IDENTITY — protocol.md §2: one mnemonic → two unrelated key pairs.
@@ -170,6 +229,8 @@ interface ChatMessage {
   timestamp: string;  // a human-readable time, e.g. "3:42:10 PM"
   encrypted: boolean; // wire framing: true → sealed {ct} block; false → {text}
                       // plaintext block, rendered in RED in the transcript
+  restored?: boolean; // came back in the history push (§5.4.2), not typed now;
+                      // echoes are rebuilt from the stored prompt (D025)
 }
 
 // Which wire mode the CURRENT WebSocket speaks:
@@ -246,7 +307,13 @@ export default function ChatApp() {
     recipient: Awaited<ReturnType<CipherSuite["createRecipientContext"]>> | null; // opens s2c
     sessionId: Uint8Array | null;                                         // this handshake's fingerprint
     tHello: Uint8Array | null;                                            // our signed hello bytes
-  }>({ identity: null, pinnedEd: null, pinnedX: null, sender: null, recipient: null, sessionId: null, tHello: null });
+    awaitingHistory: boolean;                                             // AWAIT_HISTORY phase (§5.6)
+    policy: HistoryPolicy | null;                                         // from the history push
+    epochs: Map<string, Epoch>;                                           // b64u(id) → epoch, live ones only
+  }>({
+    identity: null, pinnedEd: null, pinnedX: null, sender: null, recipient: null,
+    sessionId: null, tHello: null, awaitingHistory: false, policy: null, epochs: new Map(),
+  });
 
   /* ---------------------------- auto-scroll ----------------------------- */
   useEffect(() => {
@@ -291,6 +358,12 @@ export default function ChatApp() {
     link.current.recipient = null;
     link.current.sessionId = null;
     link.current.tHello = null;
+    // Nothing about history is persisted in the browser (§9.6): zero the epoch
+    // scalars and forget them. The next handshake gets them back from the server.
+    for (const e of link.current.epochs.values()) e.scalar.fill(0);
+    link.current.epochs.clear();
+    link.current.policy = null;
+    link.current.awaitingHistory = false;
     c2sSeq.current = 0;
     lastS2C.current = -1;
     wireMode.current = 'none';
@@ -549,7 +622,9 @@ const wsBase =
       if (!ed25519.verify(sig, tServerHello, L.pinnedEd!))
         throw new Error('server_hello rejected');
 
-      // Step 4 — session fingerprint + incoming pipe. Channel is live.
+      // Step 4 — session fingerprint + incoming pipe. Not live yet: the
+      // server's very next frame is the history push (§5.4.2), and we need
+      // our epoch keys from it before we can seal a prompt.
       L.sessionId = sha256(concatBytes(L.tHello!, tServerHello)).slice(0, 16);
       const myPriv = await suite.kem.importKey("raw", ab(L.identity!.xScalar), false);
       L.recipient = await suite.createRecipientContext({
@@ -557,6 +632,24 @@ const wsBase =
         enc: ab(encS2c),
         info: ab(HPKE_INFO),
       });
+      L.awaitingHistory = true;
+      setStatusNote('Handshake done — waiting for history…');
+      return;
+    }
+
+    // ------------------- AWAIT_HISTORY: the one-time push -------------------
+    // Strict: it must be a `history` frame at s2c seq 0, opened with TYPE 0x05.
+    // Anything else here is a fault (§5.6).
+    if (L.awaitingHistory) {
+      if (data.type !== 'history') throw new Error('wrong frame for phase');
+      if (data.seq !== '0000000000000000') throw new Error('seq gate');
+      const ct = unb64u(data.ct, -1);
+      if (ct.length < 16) throw new Error('bad ct');
+      const aad = buildAad(L.sessionId!, DIR_S2C, 0, TYPE_HISTORY);
+      const pt = await L.recipient.open(ab(ct), ab(aad));
+      lastS2C.current = 0;
+      await restoreHistory(JSON.parse(new TextDecoder().decode(pt)));
+      L.awaitingHistory = false;
       setEncChannel(true);
       setStatusNote('Encrypted channel established.');
       return;
@@ -603,6 +696,102 @@ const wsBase =
     throw new Error('PLAINTEXT_ON_SECURE');
   };
 
+  /* --------------------------- STORED HISTORY ---------------------------- */
+  // The history push (§5.4.2), in plain English:
+  //   1. Every live epoch key comes back sealed to OUR identity key — open it
+  //      with the X25519 scalar the mnemonic gave us (§9.2). Any browser with
+  //      the same 24 words can; the server never could.
+  //   2. Every record is sealed to one of those epoch keys — open it (§9.3).
+  //   3. Rebuild the transcript: the prompt, then the echo the server would
+  //      have sent (it is deterministic, D025), both marked "restored".
+  // A blob that fails to open is skipped, never rendered. The transcript is
+  // REPLACED, not appended to: what the server holds is the conversation.
+  const restoreHistory = async (h: {
+    policy: { epoch_length_s: number; window_s: number };
+    epochs: { epoch: string; created_at: number; enc: string; ct: string }[];
+    records: { epoch: string; created_at: number; enc: string; ct: string }[];
+  }) => {
+    const L = link.current;
+    const id = L.identity!;
+    if (typeof h?.policy?.epoch_length_s !== 'number' || typeof h?.policy?.window_s !== 'number')
+      throw new Error('bad history');
+    L.policy = { epochLengthS: h.policy.epoch_length_s, windowS: h.policy.window_s };
+
+    for (const e of h.epochs ?? []) {
+      const epochId = unb64u(e.epoch, EPOCH_ID_LEN);
+      const scalar = await openFrom(
+        id.xScalar, { enc: unb64u(e.enc, 32), ct: unb64u(e.ct, 48) },
+        INFO_EPOCH_KEY, storageAad(id.edPub, epochId),
+      );
+      L.epochs.set(e.epoch, {
+        id: epochId, scalar, pub: x25519.getPublicKey(scalar), createdAt: e.created_at,
+      });
+    }
+
+    const restored: ChatMessage[] = [];
+    for (const r of h.records ?? []) {
+      const epoch = L.epochs.get(r.epoch);
+      if (!epoch) continue;                       // its key was erased: unrecoverable by design
+      let text: string;
+      let ts: number;
+      try {
+        const pt = await openFrom(
+          epoch.scalar, { enc: unb64u(r.enc, 32), ct: unb64u(r.ct, -1) },
+          INFO_RECORD, storageAad(id.edPub, epoch.id),
+        );
+        const rec = JSON.parse(new TextDecoder().decode(pt));
+        if (typeof rec?.text !== 'string') continue;
+        text = rec.text;
+        ts = typeof rec.ts === 'number' ? rec.ts : r.created_at * 1000;
+      } catch {
+        continue;                                  // wrong owner/epoch or corrupt: not shown
+      }
+      const when = new Date(ts).toLocaleString();
+      restored.push({
+        id: nextMsgId.current++, seq: -1, text, type: 'msg', sender: 'user',
+        timestamp: when, encrypted: true, restored: true,
+      });
+      restored.push({
+        id: nextMsgId.current++, seq: -1, text: `ECHO: ${text}`, type: 'msg', sender: 'assistant',
+        timestamp: when, encrypted: true, restored: true,
+      });
+    }
+    setMessages(restored);
+  };
+
+  // The epoch to seal the next record to (§9.5): reuse the newest live epoch
+  // while it is younger than EPOCH_LENGTH, otherwise mint a fresh random one,
+  // seal its scalar to our identity key, and upload it in an `epoch_key` frame
+  // BEFORE the msg that will reference it. Both frames share the c2s counter.
+  const ensureEpoch = async (ws: WebSocket): Promise<Epoch> => {
+    const L = link.current;
+    const id = L.identity!;
+    const nowS = Math.floor(Date.now() / 1000);
+    let newest: Epoch | null = null;
+    for (const e of L.epochs.values())
+      if (!newest || e.createdAt > newest.createdAt) newest = e;
+    if (newest && nowS - newest.createdAt < L.policy!.epochLengthS) return newest;
+
+    const scalar = x25519.utils.randomSecretKey();
+    const epoch: Epoch = {
+      id: crypto.getRandomValues(new Uint8Array(EPOCH_ID_LEN)),
+      scalar, pub: x25519.getPublicKey(scalar), createdAt: nowS,
+    };
+    const sealed = await sealTo(id.xPub, scalar, INFO_EPOCH_KEY, storageAad(id.edPub, epoch.id));
+    const pt = te.encode(JSON.stringify({
+      epoch: b64u(epoch.id), enc: b64u(sealed.enc), ct: b64u(sealed.ct),
+    }));
+    const seq = c2sSeq.current;
+    const aad = buildAad(L.sessionId!, DIR_C2S, seq, TYPE_EPOCH_KEY);
+    const ct = new Uint8Array(await L.sender!.seal(ab(pt), ab(aad)));
+    ws.send(JSON.stringify({
+      type: 'epoch_key', seq: seq.toString(16).padStart(16, '0'), ct: b64u(ct),
+    }));
+    c2sSeq.current += 1;                           // one seal, one counter tick
+    L.epochs.set(b64u(epoch.id), epoch);
+    return epoch;
+  };
+
   /* ------------------------------ SENDING -------------------------------- */
   const handleSend = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -616,17 +805,16 @@ const wsBase =
       return;
     }
 
-    const currentSeq = c2sSeq.current;
     const sendingEncrypted =
       wireMode.current === 'secure' && encrypt && channelEstablished &&
-      !!link.current.sender && !!link.current.sessionId;
+      !!link.current.sender && !!link.current.sessionId && !!link.current.policy;
 
     // What we show in OUR OWN transcript (always the readable words — it's our
     // message; encryption only changes what goes over the wire). The
     // 'encrypted' flag drives the RED plaintext highlight.
     const localEcho: ChatMessage = {
       id: nextMsgId.current++,
-      seq: currentSeq,
+      seq: c2sSeq.current,
       text,
       type: 'msg',
       sender: 'user',
@@ -636,13 +824,26 @@ const wsBase =
 
     try {
       if (sendingEncrypted) {
-        // ENCRYPTED path: build the authentication label for "browser→server,
-        // message, counter N", seal the text, and put ONLY {type, seq, ct} on
-        // the wire. A proxy that terminates TLS sees ciphertext, not words.
-        const aad = buildAad(link.current.sessionId!, DIR_C2S, currentSeq);
-        const ct = new Uint8Array(
-          await link.current.sender!.seal(ab(te.encode(text)), ab(aad)),
+        // ENCRYPTED path. First make sure an epoch key is live (this may send
+        // an `epoch_key` frame and tick the counter). Then seal the prompt to
+        // the epoch key for storage (§9.3), wrap words + record into the §7.5
+        // plaintext, build the authentication label for "browser→server, msg,
+        // counter N", seal, and put ONLY {type, seq, ct} on the wire. A proxy
+        // that terminates TLS sees ciphertext, not words — and so does the
+        // server for the stored copy.
+        const epoch = await ensureEpoch(ws);
+        const id = link.current.identity!;
+        const rec = await sealTo(
+          epoch.pub, te.encode(JSON.stringify({ text, ts: Date.now() })),
+          INFO_RECORD, storageAad(id.edPub, epoch.id),
         );
+        const plaintext = te.encode(JSON.stringify({
+          text, rec: { epoch: b64u(epoch.id), enc: b64u(rec.enc), ct: b64u(rec.ct) },
+        }));
+        const currentSeq = c2sSeq.current;
+        localEcho.seq = currentSeq;
+        const aad = buildAad(link.current.sessionId!, DIR_C2S, currentSeq, TYPE_MSG);
+        const ct = new Uint8Array(await link.current.sender!.seal(ab(plaintext), ab(aad)));
         ws.send(JSON.stringify({
           type: 'msg',
           seq: currentSeq.toString(16).padStart(16, '0'),
@@ -654,7 +855,7 @@ const wsBase =
         // the secure channel carries 'ct'. Registering the transmit in
         // plainPending is what LICENSES the matching echo: without it the
         // incoming plaintext echo would be dropped by handleFrame.
-        ws.send(JSON.stringify({ type: 'msg', seq: currentSeq, text }));
+        ws.send(JSON.stringify({ type: 'msg', seq: c2sSeq.current, text }));
         plainPending.current += 1;
       } else {
         // Mode mismatch (e.g. Encrypt is ON but the channel is not
@@ -853,6 +1054,9 @@ const wsBase =
               <div className={`cg-bubble${msg.encrypted ? '' : ' plain'}`}>
                 {!msg.encrypted && (
                   <div className="cg-plain-badge">⚠ plaintext — not encrypted</div>
+                )}
+                {msg.restored && (
+                  <div className="cg-restored-badge">restored from history</div>
                 )}
                 <div className={`cg-text${msg.encrypted ? '' : ' plain'}`}>{msg.text}</div>
                 <div className="cg-time">{msg.timestamp}</div>
