@@ -59,7 +59,7 @@
   from the code-integrity trust path.
 
 
-### D009 — Identity = BIP-39 24-word mnemonic, deterministic keys via HKDF tree ✅ *(updated)*
+### D009 — Identity = BIP-39 24-word mnemonic, deterministic keys via HKDF tree ✅ *(updated; tradeoff superseded by D026)*
 - **Chose:** Derive a static identity from a 24-word BIP-39 mnemonic via the standard BIP-39
   seed process and an HKDF-SHA256 key tree, yielding an X25519 HPKE-recipient key and an
   Ed25519 signing key.
@@ -75,7 +75,9 @@
   is consistent with `threat-model.md`, which already scopes "stolen server private key" out.
   Real forward secrecy would require per-epoch **ephemeral recipient** keys (not merely rotating
   the static identity) — future work / stretch goal. Private keys never go on the wire and are
-  imported non-extractable where the platform allows.
+  imported non-extractable where the platform allows. **→ Done in D026:** both channel
+  directions now seal to per-connection ephemeral recipient keys; the static X25519 key is the
+  storage identity only (§9.2). The derivation in this entry is unchanged.
 
 
 ### D010 — Seed derivation = standard BIP-39 mnemonicToSeed parameters ✅
@@ -142,7 +144,7 @@ Go, and Rust.
   rotation named in D009. **Note (Step-1 F1):** this rotation bounds nonce exhaustion and mints a
   fresh `SESSION_ID`, but on its own it does **not** add forward secrecy while the recipient key
   is a static BIP-39 identity; forward secrecy needs per-epoch ephemeral recipient keys 
-  (future / stretch goal). 
+  (delivered per connection by D026). 
 
 ### D015 — Mandatory `server_hello` acceptance gate  ✅
 - **Chose:** Require the browser to **cross-check the contents** of `T_server_hello`, not
@@ -293,9 +295,9 @@ Go, and Rust.
 - **Tradeoff (accepted, documented in `threat-model.md`):** expiry rests on the **server
   erasing on schedule** — the browser cannot verify deletion. Within the window a stolen
   mnemonic reads everything (the identity key is static by D009). An epoch private key sits in
-  browser memory for the length of a session. A wire recording of the channel stays
-  recoverable via the server's static key until per-connection forward secrecy lands (next
-  ADR); the two are complementary halves of one claim.
+  browser memory for the length of a session. A wire recording of the channel was
+  recoverable via the server's static key until D026 closed that half; the two are
+  complementary halves of one claim.
 
 ### D023 — Wire contract: record rides inside the sealed `msg`; new `epoch_key` (c2s) and `history` (s2c) frames ✅
 - **Chose:** The **c2s `msg` plaintext becomes structured JSON** — `{ text, rec }` — where
@@ -343,3 +345,57 @@ Go, and Rust.
   its own — reintroduces the server-held key D021 rejects, for one direction only.
 - **Why:** The echo server is deterministic, so the stored prompt *is* the echo. When a real
   reply-producing backend replaces the echo, this entry is the one to revisit.
+
+## Channel Forward Secrecy (ADR 2)
+
+### D026 — Per-connection ephemeral recipient keys in both directions ✅
+- **Chose:** Each side mints a **fresh X25519 keypair for every connection**, signs its
+  public half with its Ed25519 identity, uses it as the HPKE recipient key for the incoming
+  direction, and **wipes the private half at teardown**. The browser→server context seals to
+  the server ephemeral (`server_key`, §4.0); the server→browser context seals to the browser
+  ephemeral (`hello`, §4.2). The static X25519 identity key leaves the channel entirely and
+  keeps one job: sealing epoch keys for stored history (§9.2).
+- **Rejected:** (a) Keeping static recipient keys (the D009 posture) — a recording of the wire
+  plus a later theft of the server's static key decrypts every prompt ever sent
+  (harvest-now-decrypt-later), and ADR 212's key erasure would leave that copy untouched.
+  (b) Rotating the *static* identity on a schedule — the D014 note already says this adds no
+  forward secrecy. (c) Mid-session rekeying only — more machinery (rekey frames, counter
+  resets on a live socket) for a weaker guarantee than "nothing survives the connection";
+  it remains available as a later refinement on top of this.
+- **Why:** Forward secrecy is the erase-a-key mechanism applied to the channel: once the
+  recipient private keys are gone, no key that survives the session can open its ciphertext.
+  It is the second half of the ADR 212 claim — after the history window, neither the stored
+  copy nor a captured copy of a prompt is recoverable. The cost is one extra handshake frame
+  and one keypair generation per side per connection.
+- **Tradeoff (accepted):** identity theft still allows **impersonation going forward** (any
+  signature-based identity has this limit); compromise of an ephemeral *during* a live
+  session exposes that session; a long-lived connection shares one pair of contexts.
+
+### D027 — Server-first `server_key` frame, `v2` transcript labels, `SESSION_ID` over three transcripts ✅
+- **Chose:** On WebSocket accept the server sends `server_key` = `{server_x25519 (ephemeral),
+  sig over T_server_key}` **before** the browser speaks; the browser gates it against the pin
+  (§4.0.1), mints its own ephemeral, then sends `hello`. `hello` and `server_hello` keep their
+  byte layouts but carry ephemerals, so their labels bump to **`v2`** and `pubkey`'s to `v2`
+  (its layout shrank). `SESSION_ID = SHA-256(T_server_key ‖ T_hello ‖ T_server_hello)[:16]`.
+- **Rejected:** (a) Minting the ephemeral in `/pubkey` per request — binds HTTP state to a
+  later WebSocket (a nonce, a TTL, a cache of unspent ephemerals), and a proxy can request
+  them freely. (b) A browser-first three-frame flow (`hello` → `server_hello` →
+  `client_finish`) — one more round trip for the same result. (c) Keeping the `v1` labels —
+  a signature over a v1 transcript would verify inside a v2 handshake with the same bytes.
+- **Why:** The browser cannot seal to a key it has not seen, so *someone* must send a second
+  time; letting the server speak first costs no extra round trip because the browser was
+  waiting on the socket anyway. Fresh labels are the D013 discipline: change the meaning,
+  change the domain separator. **Cost / ripple:** the frozen contract moves again (§0, §3.0,
+  §4, §5, §5.6, §7.1) — both implementations must build the three transcripts and the
+  `SESSION_ID` byte-identically or every `open()` fails.
+
+### D028 — `/pubkey` carries only the Ed25519 pin confirmation; no backward compatibility ✅
+- **Chose:** `/pubkey` = `{server_ed25519, sig over T_pubkey = label ‖ server_ed25519}`. The
+  X25519 field is removed. The pin gate (§4.1.1) is unchanged in spirit: compare to the pin
+  first, verify, then open the socket.
+- **Rejected:** Keeping `server_x25519` in `/pubkey` "for compatibility" — it would be a
+  key that must never be sealed to, sitting on the wire as an invitation to do exactly that.
+- **Why:** One root of trust (the pinned Ed25519 identity), one place where a recipient key
+  arrives (`server_key`), and the static X25519 key is once again a single-purpose key
+  (D011): storage identity for the browser, nothing at all for the server. The old deployed
+  demo is not a compatibility target (the proxy stack is retired in ADR 3).

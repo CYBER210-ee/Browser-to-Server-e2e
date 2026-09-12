@@ -41,12 +41,12 @@ the proxy · the deploy directory (ADR 3).
 ## Checklist
 
 ### 1. Docs first, then re-freeze
-- [ ] D026–D028 in `docs/decisions.md` (ephemeral recipient keys · server-first `server_key`
+- [x] D026–D028 in `docs/decisions.md` (ephemeral recipient keys · server-first `server_key`
       frame + `v2` labels · `/pubkey` trimmed; D009 corrected)
-- [ ] `docs/protocol.md`: §0 labels and `SESSION_ID`, §2 (static X25519 = storage only),
+- [x] `docs/protocol.md`: §0 labels and `SESSION_ID`, §2 (static X25519 = storage only),
       §3.0, §4 transcripts incl. new §4.0 `server_key`, §5.1–§5.3 shapes, §5.6 phases,
       §7.1 setup, §8, §9.6
-- [ ] `docs/threat-model.md`: forward secrecy now holds for the channel; wire-recording
+- [x] `docs/threat-model.md`: forward secrecy now holds for the channel; wire-recording
       limitation removed; L2/L3 rows; key-management limitation rewritten
 
 ### 2. Server (`server/hpke_server.py`, `server/secure_link.py`, `server/main.py`)

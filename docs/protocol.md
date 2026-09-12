@@ -15,6 +15,9 @@ signed transcript"; "monotonic sequence numbers [are] bound into AAD"; and
 bound into AAD (§3.0.1)** so a sealed message cannot be reflected into a different
 session or reinterpreted as a different frame kind. **Stored history** (ADR 212) is
 sealed in the browser to per-epoch keys and expires by server-side key erasure (§9).
+**Both HPKE recipient keys are per-connection ephemerals** (ADR 2, D026): the channel is
+forward-secret against later theft of either static identity key, and the static X25519
+key's only remaining job is storage (§9).
 
 ---
 
@@ -29,10 +32,11 @@ The following are frozen decisions you must paste in verbatim.
 | 3 | Ed25519 `info` string | `"echovault-ed25519-signing"` | D011 |
 | 4 | Direction tokens | `"c2s"` / `"s2c"` | D013/handshake |
 | 5 | HPKE Info | `info = "echovault/hpke/v1"` | D013 |
-| 6 | Transcript layout pubkey | `"echovault/pubkey/v1"` | D013 |
-| 7 | Transcript layout hello | `"echovault/hello/v1"` | D013 |
-| 8 | Transcript layout server_hello | `"echovault/server_hello/v1"` | D013 |
-| 9 | `SESSION_ID` derivation | `SHA-256(T_hello ‖ T_server_hello)[:16]` — 16 bytes (§3.0) | D013 |
+| 6 | Transcript layout pubkey | `"echovault/pubkey/v2"` (§4.1; was v1 before D028) | D013/D028 |
+| 7 | Transcript layout hello | `"echovault/hello/v2"` (§4.2; was v1 before D027) | D013/D027 |
+| 8 | Transcript layout server_hello | `"echovault/server_hello/v2"` (§4.3; was v1 before D027) | D013/D027 |
+| 9 | `SESSION_ID` derivation | `SHA-256(T_server_key ‖ T_hello ‖ T_server_hello)[:16]` — 16 bytes (§3.0) | D013/D027 |
+| 9a | Transcript layout server_key | `"echovault/server_key/v1"` (§4.0) | D027 |
 | 10 | AAD message-type code | `msg = 0x01` (1 byte; `0x02`/`0x03` reserved for hello/server_hello, never sealed) — §3.0.1 | D020 |
 | 11 | AAD message-type codes, history frames | `epoch_key = 0x04` (c2s) · `history = 0x05` (s2c) — §3.0.1 | D023 |
 | 12 | Storage HPKE `info`, epoch key | `"echovault/epoch-key/v1"` — seals an epoch private key to the identity key (§9.2) | D022 |
@@ -73,6 +77,12 @@ Derived lengths used throughout:
 One BIP-39 phrase deterministically produces **two unrelated key pairs**: an
 X25519 encryption pair and an Ed25519 signing pair. Domain separation comes from
 two distinct HKDF `info` strings.
+
+> **Roles (D026).** The Ed25519 pair signs the handshake transcripts (§4). The static
+> X25519 pair is the **storage identity** — epoch keys are sealed to it (§9.2). It is
+> **not** an HPKE recipient key on the channel: both channel directions seal to
+> per-connection ephemeral X25519 keys (§4.0, §4.2, §7.1). The derivation is unchanged;
+> only the X25519 pair's job moved.
 
 ### 2.1 Pipeline
 
@@ -150,17 +160,17 @@ established the keys, so a ciphertext captured in one session cannot be replayed
 happen to line up.
 
 ```
-SESSION_ID = SHA-256( T_hello ‖ T_server_hello )   [first 16 bytes]
+SESSION_ID = SHA-256( T_server_key ‖ T_hello ‖ T_server_hello )   [first 16 bytes]
 ```
 
-- `T_hello` (178 raw bytes, §4.2) and `T_server_hello` (185 raw bytes, §4.3) are the
-  exact signed transcripts both parties already hold **after** the handshake
-  completes. Concatenate raw bytes in that order, SHA-256, and take the **first 16
-  bytes**.
-- Because both transcripts contain both `enc` values and both parties' static keys,
-  `SESSION_ID` is a 128-bit fingerprint of the whole handshake. Two different
-  sessions (different ephemerals) produce different `SESSION_ID`s with overwhelming
-  probability.
+- `T_server_key` (87 raw bytes, §4.0), `T_hello` (178 raw bytes, §4.2) and
+  `T_server_hello` (185 raw bytes, §4.3) are the exact signed transcripts both parties
+  already hold **after** the handshake completes. Concatenate raw bytes in that order,
+  SHA-256, and take the **first 16 bytes**.
+- Because the transcripts contain both `enc` values, both parties' **ephemeral**
+  recipient keys and both Ed25519 identities, `SESSION_ID` is a 128-bit fingerprint of
+  the whole handshake. Two different sessions (different ephemerals) produce different
+  `SESSION_ID`s with overwhelming probability.
 - `SESSION_ID` is **derived, never transmitted.** Both sides recompute it locally,
   exactly like the rest of the AAD (§3.2). It MUST be identical byte-for-byte across
   the JS and Python sides — add it to the D012 interop test.
@@ -264,20 +274,51 @@ for one message type can never be replayed as another.
 > signature alone is a conformance failure and reopens key substitution — see the
 > mandatory gates in §4.1 (S2) and §4.3 (S1).
 
-### 4.1 `GET /pubkey` — signed by the **server** Ed25519 key
+### 4.0 `server_key` — signed by the **server** Ed25519 key (D027)
+
+The server mints a **fresh X25519 keypair for every connection** and sends its public
+half, signed, as the first frame on the WebSocket — before the browser says anything.
+This is the recipient key the browser seals the prompt direction to; it exists only
+for this connection and is wiped at teardown (§7.1).
 
 ```
-T_pubkey = "echovault/pubkey/v1"   (19 ASCII bytes)
-         ‖ server_x25519           (32 raw)
-         ‖ server_ed25519          (32 raw)                         total = 83 bytes
+T_server_key = "echovault/server_key/v1"  (23 ASCII bytes)
+             ‖ server_x25519              (32 raw)   ← EPHEMERAL, this connection only
+             ‖ server_ed25519             (32 raw)   ← the pinned identity
+                                                              total = 87 bytes
+sig = Ed25519_Sign(server_ed25519_priv, T_server_key)
+```
+
+| Order | Field | Encoding in transcript | Bytes |
+|------:|-------|------------------------|------:|
+| 1 | label `"echovault/server_key/v1"` | ASCII | 23 |
+| 2 | `server_x25519` (ephemeral public) | raw | 32 |
+| 3 | `server_ed25519` (public) | raw | 32 |
+
+#### 4.0.1 Mandatory `server_key` acceptance gate
+
+The browser MUST, on receiving `server_key`, in order: (1) `Ed25519_Verify(sig,
+T_server_key)` with the **pinned** `server_ed25519`; (2) assert the transcript's
+`server_ed25519` equals the pin byte-for-byte; (3) only then adopt `server_x25519` as
+this connection's recipient key and mint its own ephemeral (§4.2). Abort on any failure
+(§7.4). The ephemeral is **never** cached across connections: a `server_key` is good for
+exactly the connection it arrived on.
+
+### 4.1 `GET /pubkey` — signed by the **server** Ed25519 key (D028)
+
+Confirmation material for the out-of-band pin, nothing more. It carries **no** X25519
+key: the recipient key arrives per connection in `server_key` (§4.0).
+
+```
+T_pubkey = "echovault/pubkey/v2"   (19 ASCII bytes)
+         ‖ server_ed25519          (32 raw)                         total = 51 bytes
 sig = Ed25519_Sign(server_ed25519_priv, T_pubkey)
 ```
 
 | Order | Field | Encoding in transcript | Bytes |
 |------:|-------|------------------------|------:|
-| 1 | label `"echovault/pubkey/v1"` | ASCII | 19 |
-| 2 | `server_x25519` (public) | raw | 32 |
-| 3 | `server_ed25519` (public) | raw | 32 |
+| 1 | label `"echovault/pubkey/v2"` | ASCII | 19 |
+| 2 | `server_ed25519` (public) | raw | 32 |
 
 > **Note (F11 clarification).** The handshake authenticates the **server to the
 > browser**: the browser verifies this signature against the **pinned** server
@@ -297,8 +338,8 @@ pin. The browser MUST, on receiving the `/pubkey` response, in order:
    (byte-for-byte). If it differs, **abort** — do not proceed, do not "learn" the key.
 2. `Ed25519_Verify(response.sig, T_pubkey)` using the **pinned** `server_ed25519`
    (equivalently the just-confirmed wire value; they are now identical).
-3. Adopt `response.server_x25519` as the server HPKE recipient key **only** because it
-   is bound, by this verified signature, to the pinned identity.
+3. Only then open the WebSocket and wait for `server_key` (§4.0), which is where the
+   recipient key arrives — bound to the same pinned identity by its own signature.
 
 - **The server identity MUST NEVER be learned from the wire.** Trust-on-first-use from
   `/pubkey` is a **conformance violation**: an active proxy present at first contact
@@ -310,23 +351,28 @@ pin. The browser MUST, on receiving the `/pubkey` response, in order:
 ### 4.2 `hello` — signed by the **browser** Ed25519 key
 
 Binds the browser's ephemeral material **to the specific server key it sealed to**
-(anti key-substitution").
+(anti key-substitution). `browser_x25519` is the browser's **per-connection ephemeral**
+recipient key (D026) — the static X25519 identity key never appears in a transcript.
 
 ```
-T_hello = "echovault/hello/v1"     (18 ASCII bytes)
-        ‖ browser_x25519           (32 raw)
-        ‖ browser_ed25519          (32 raw)
+T_hello = "echovault/hello/v2"     (18 ASCII bytes)
+        ‖ browser_x25519           (32 raw)   ← EPHEMERAL, this connection only
+        ‖ browser_ed25519          (32 raw)   ← static identity (signs this transcript)
         ‖ enc                      (32 raw)   ← browser→server HPKE encapsulated key
-        ‖ server_x25519            (32 raw)   ← pins which server padlock was used
+        ‖ server_x25519            (32 raw)   ← the server EPHEMERAL accepted in §4.0.1
         ‖ server_ed25519           (32 raw)   ← pins the server identity
                                                               total = 178 bytes
 sig = Ed25519_Sign(browser_ed25519_priv, T_hello)
 ```
 
-- The browser MUST place, in `server_x25519` / `server_ed25519`, exactly the
-  **pin-confirmed** server keys from §4.1.1 (not whatever a proxy might have injected).
-  This is what lets the server's counter-signature in §4.3 be cross-checked back to the
-  browser's own view.
+- The browser MUST place, in `server_x25519`, exactly the ephemeral it accepted from
+  `server_key` (§4.0.1) and, in `server_ed25519`, the pin — not whatever a proxy might
+  have injected. This is what lets the server's counter-signature in §4.3 be cross-checked
+  back to the browser's own view.
+- The server, on `hello`, MUST verify `sig` against `hello.browser_ed25519` **and**
+  assert `T_hello.server_x25519` equals **its own ephemeral for this connection** and
+  `T_hello.server_ed25519` equals its identity. A `hello` sealed to any other key — a
+  previous connection's ephemeral included — is rejected (§7.4).
 
 ### 4.3 `server_hello` — signed by the **server** Ed25519 key
 
@@ -334,11 +380,11 @@ Binds the server's reply material back to the browser's `hello` (both directions
 are covered).
 
 ```
-T_server_hello = "echovault/server_hello/v1"  (25 ASCII bytes)
+T_server_hello = "echovault/server_hello/v2"  (25 ASCII bytes)
                ‖ enc                (32 raw)   ← server→browser HPKE encapsulated key
-               ‖ browser_x25519     (32 raw)   ← from hello
+               ‖ browser_x25519     (32 raw)   ← from hello (browser ephemeral)
                ‖ browser_ed25519    (32 raw)   ← from hello
-               ‖ server_x25519      (32 raw)
+               ‖ server_x25519      (32 raw)   ← the server ephemeral of §4.0
                ‖ server_ed25519     (32 raw)
                                                               total = 185 bytes
 sig = Ed25519_Sign(server_ed25519_priv, T_server_hello)
@@ -347,7 +393,7 @@ sig = Ed25519_Sign(server_ed25519_priv, T_server_hello)
 #### 4.3.1 Mandatory `server_hello` acceptance gate — closes reply-direction key substitution (S1)
 
 **Motivation (do not remove).** The browser→server (c2s) direction seals to the server's
-static key using the browser's *ephemeral* `enc`, so it does **not** depend on
+ephemeral key using the browser's *ephemeral* `enc`, so it does **not** depend on
 `browser_x25519`. The server→browser (s2c) direction seals the **echo reply — which
 carries the prompt back and is a declared protected asset** — to `browser_x25519`, and
 the server holds **no pin for the browser**. An active TLS-terminating proxy can
@@ -368,10 +414,9 @@ The browser MUST, on receiving `server_hello`, perform **all** of the following 
 
 1. `Ed25519_Verify(server_hello.sig, T_server_hello)` using the **pinned**
    `server_ed25519` (§4.1.1). Reject on failure.
-2. Assert `T_server_hello.server_x25519 == PINNED_server_x25519` **and**
-   `T_server_hello.server_ed25519 == PINNED_server_ed25519` (the pin-confirmed server
-   identity). Reject on any mismatch.
-3. Assert `T_server_hello.browser_x25519 == my browser_x25519` **and**
+2. Assert `T_server_hello.server_x25519 == the ephemeral accepted in §4.0.1` **and**
+   `T_server_hello.server_ed25519 == PINNED_server_ed25519`. Reject on any mismatch.
+3. Assert `T_server_hello.browser_x25519 == my ephemeral browser_x25519` **and**
    `T_server_hello.browser_ed25519 == my browser_ed25519` — byte-for-byte equal to the
    values the browser put in its own `hello` (§4.2). **This is the check that defeats S1.**
    Reject on any mismatch.
@@ -383,8 +428,8 @@ The browser MUST, on receiving `server_hello`, perform **all** of the following 
   the substituted key, or send any `msg`.
 - The server performs the analogous sanity check on `hello`: it MUST verify
   `hello.sig` against `hello.browser_ed25519` and confirm `hello.server_x25519` /
-  `hello.server_ed25519` equal **its own** identity keys (rejecting a `hello` that sealed
-  to some other server key). Note this does **not** authenticate *which* browser is
+  `hello.server_ed25519` equal **its own ephemeral for this connection** and its identity
+  (rejecting a `hello` that sealed to some other server key). Note this does **not** authenticate *which* browser is
   talking (browser identity is out of scope, §4.1 note) — it only ensures the client
   sealed to this server.
 
@@ -399,7 +444,7 @@ JSON objects. Every binary value is a string (base64url, no padding — §6). Th
 one exception is `seq`, which is hex. **There is no `iv` field in any frame,
 anywhere in EchoVault.**
 > Frames divide into two classes. **Handshake frames** (`GET /pubkey`
-> response, `hello`, `server_hello`) establish and authenticate the HPKE
+> response, `server_key`, `hello`, `server_hello`) establish and authenticate the HPKE
 > contexts; they carry key material and signatures only and never carry
 > prompt content. **Encrypted payload frames** (`msg`, `epoch_key`, `history`) carry
 > prompt content and stored-history material exclusively as encrypted `ct`, only after
@@ -409,20 +454,33 @@ anywhere in EchoVault.**
 
 ```json
 {
-  "server_x25519":  "…",   // base64url · 32-byte raw X25519 public key
   "server_ed25519": "…",   // base64url · 32-byte raw Ed25519 public key
   "sig":            "…"    // base64url · 64-byte Ed25519 signature over T_pubkey (§4.1)
 }
 ```
 > Accepted **only** if it passes the §4.1.1 pin-comparison gate. The `server_ed25519`
 > here is confirmation material for the out-of-band pin, never a source of new trust.
+> There is no X25519 key here (D028): recipient keys are per connection (§5.1.1).
+
+### 5.1.1 `server_key`  (server → browser, first frame on the socket)
+
+```json
+{
+  "type":          "server_key",
+  "server_x25519": "…",  // base64url · 32-byte raw X25519 public key — EPHEMERAL
+  "sig":           "…"   // base64url · 64-byte Ed25519 signature over T_server_key (§4.0)
+}
+```
+> Sent by the server immediately on accept, before any browser frame. Accepted only via
+> the §4.0.1 gate (pinned-signature verify + identity compare). Good for this connection
+> only.
 
 ### 5.2 `hello`  (browser → server)
 
 ```json
 {
   "type":            "hello",
-  "browser_x25519":  "…",  // base64url · 32-byte raw X25519 public key
+  "browser_x25519":  "…",  // base64url · 32-byte raw X25519 public key — EPHEMERAL (D026)
   "browser_ed25519": "…",  // base64url · 32-byte raw Ed25519 public key
   "enc":             "…",  // base64url · 32-byte HPKE encapsulated key (browser→server)
   "sig":             "…"   // base64url · 64-byte Ed25519 signature over T_hello (§4.2)
@@ -438,9 +496,9 @@ anywhere in EchoVault.**
   "sig":   "…"              // base64url · 64-byte Ed25519 signature over T_server_hello (§4.3)
 }
 ```
-> The browser reconstructs `T_server_hello` from `enc`, its **own** `browser_x25519` /
-> `browser_ed25519`, and its **pinned** `server_x25519` / `server_ed25519`, then applies
-> the §4.3.1 gate. The `browser_*` and `server_*` fields are therefore not re-sent on the
+> The browser reconstructs `T_server_hello` from `enc`, its **own** ephemeral
+> `browser_x25519` / `browser_ed25519`, the server ephemeral it **accepted in §4.0.1**
+> and the **pinned** `server_ed25519`, then applies the §4.3.1 gate. The `browser_*` and `server_*` fields are therefore not re-sent on the
 > wire (the browser already holds the authoritative copies); resending them would be
 > attacker-controlled input and MUST NOT be trusted if present.
 
@@ -544,13 +602,15 @@ dispatch into another handler):
 | Phase | Endpoint | Accepts | Rejects |
 |-------|----------|---------|---------|
 | `AWAIT_PUBKEY` | browser | `/pubkey` response | anything else |
-| `AWAIT_HELLO` | server | `hello` | `server_hello`, `msg`, `epoch_key`, unknown |
-| `AWAIT_SERVER_HELLO` | browser | `server_hello` | `hello`, `msg`, `history`, unknown |
+| `AWAIT_SERVER_KEY` | browser | `server_key` (first frame on the socket) | `hello`, `server_hello`, `msg`, `history`, unknown |
+| `AWAIT_HELLO` | server (after sending `server_key`) | `hello` | `server_key`, `server_hello`, `msg`, `epoch_key`, unknown |
+| `AWAIT_SERVER_HELLO` | browser | `server_hello` | `server_key`, `hello`, `msg`, `history`, unknown |
 | `AWAIT_HISTORY` | browser | `history` (s2c `seq 0`) | `hello`, `server_hello`, `msg`, unknown |
 | `ESTABLISHED` | server | `msg`, `epoch_key` | `hello`, `server_hello`, `history`, unknown |
 | `ESTABLISHED` | browser | `msg` | `hello`, `server_hello`, `history`, `epoch_key`, unknown |
 
-- The server moves `AWAIT_HELLO → ESTABLISHED` in one step: it sends `server_hello` and
+- The server speaks first: on accept it mints its ephemeral, sends `server_key` (§5.1.1)
+  and enters `AWAIT_HELLO`. It moves `AWAIT_HELLO → ESTABLISHED` in one step: it sends `server_hello` and
   then, without waiting, the `history` push (§5.4.2). The browser has the extra
   `AWAIT_HISTORY` phase because it must hold its epoch keys before it can seal a prompt.
 - In `ESTABLISHED`, a frame that routes as anything but the sealed types listed above is a
@@ -582,10 +642,10 @@ MUST NOT appear on the wire.
 
 | Field | Where | Encoding |
 |-------|-------|----------|
-| `server_x25519`, `browser_x25519` | pubkey, hello | base64url, no pad |
-| `server_ed25519`, `browser_ed25519` | pubkey, hello | base64url, no pad |
+| `server_x25519` (ephemeral), `browser_x25519` (ephemeral) | server_key, hello | base64url, no pad |
+| `server_ed25519`, `browser_ed25519` | pubkey, server_key, hello | base64url, no pad |
 | `enc` | hello, server_hello | base64url, no pad |
-| `sig` | pubkey, hello, server_hello | base64url, no pad |
+| `sig` | pubkey, server_key, hello, server_hello | base64url, no pad |
 | `ct` (ciphertext ‖ tag) | msg, epoch_key, history | base64url, no pad |
 | `seq` | msg, epoch_key, history | **lowercase hex**, 16 chars, zero-padded, big-endian |
 | `epoch` (16-byte `epoch_id`) | sealed plaintexts of msg, epoch_key, history | base64url, no pad |
@@ -629,17 +689,21 @@ recipient:  ctx_R      = SetupBaseR(enc, skR, info = "echovault/hpke/v1")
 
 ```
 
-`enc` (32 bytes) is the only setup value on the wire — carried once in `hello`
-(browser→server) and `server_hello` (server→browser). `info = "echovault/hpke/v1"`
-is ASCII bytes (freeze as v1). Nothing is exported; each context holds its key,
-base nonce, and sequence counter internally.
+`pkR` / `skR` is the peer's **per-connection ephemeral** X25519 keypair (D026): the
+server's, carried in `server_key` (§4.0), for the browser→server context; the browser's,
+carried in `hello` (§4.2), for the server→browser context. `enc` (32 bytes) is the other
+setup value on the wire — carried once in `hello` (browser→server) and `server_hello`
+(server→browser). `info = "echovault/hpke/v1"` is ASCII bytes (freeze as v1). Nothing is
+exported; each context holds its key, base nonce, and sequence counter internally.
 
-> **Handshake freshness is security-critical .** The server MUST run a
-> **fresh** `SetupBaseS` (a new ephemeral `enc`) for **every** connection. Reusing an
+> **Handshake freshness is security-critical.** Each side MUST mint a **fresh recipient
+> keypair** and the sender side a **fresh `enc`** for **every** connection, and MUST wipe
+> the recipient private key at teardown. Two things depend on it: (1) reusing an
 > `enc`/context across connections makes two handshakes produce the same `SESSION_ID`
-> and reopens whole-session replay (a proxy could replay a recorded `hello` and reuse
-> the captured `msg` frames). Fresh per-connection `enc` is what makes `SESSION_ID`
-> (§3.0) perturb per session; treat it as a MUST, not an optimization to remove.
+> and reopens whole-session replay; (2) the forward-secrecy claim (§8) holds **only**
+> because the recipient private keys no longer exist once the connection closes — a
+> recording of the wire cannot be opened with any key that survives the session. Treat
+> both as MUSTs, not optimizations to remove.
 
 ### 7.2 Sealing / opening message `seq`
 
@@ -756,24 +820,21 @@ The browser→server `msg` plaintext is **UTF-8 JSON**, not bare text:
   machine (§5.6) rejects cross-type reinterpretation. Replay protection is therefore
   **enforced**, not partial. Residual: the teardown behavior gives an active proxy a
   cheap reconnect/DoS lever — accepted, and out of scope (availability).
-- **Forward secrecy (D009) — corrected.** EchoVault uses HPKE base
-  mode. Each message uses a fresh ephemeral on the *sender* side, but **both**
-  directions seal to a **static** recipient key (server X25519 for c2s, BIP-39
-  browser X25519 for s2c). HPKE base mode is therefore **not** forward-secret against
-  recipient long-term-key compromise in **either** direction — the posture is
-  symmetric. Theft of the server's static X25519 key allows decryption of **all
-  captured prompts** (browser→server, the most sensitive direction) via
-  harvest-now-decrypt-later; theft of the browser static key likewise exposes
-  captured replies. This is consistent with `threat-model.md`, which already scopes
-  "stolen server private key" out of protection. Real forward secrecy is future work
-  and requires per-epoch **ephemeral recipient** keys, not merely rotating the static
-  identity (§7.3).
+- **Forward secrecy (D026) — now holds for the channel.** Both directions seal to
+  **per-connection ephemeral** recipient keys (`server_key` §4.0, `hello` §4.2) that are
+  wiped at teardown. A recording of the wire cannot be decrypted with any key that
+  survives the connection — theft of the server's or the browser's static identity key
+  *after* a session reveals nothing from it (no harvest-now-decrypt-later). What identity
+  theft still buys is **impersonation going forward** — the accepted limit of any
+  signature-based identity — and compromise of a key *during* a live session still
+  exposes that session. There is no rotation within a connection; a long session shares
+  one pair of contexts (mid-session rotation remains future work).
 - **Stored history (ADR 212, §9).** Records are sealed in the browser to random epoch
   keys, and epoch keys to the mnemonic-derived identity key; the server and the database
   hold opaque blobs. Expiry is the server **erasing** the sealed epoch key after
   `HISTORY_WINDOW` — a trust assumption on the server, recorded in `threat-model.md`.
-  Until per-connection forward secrecy lands, a wire recording remains the one copy key
-  erasure does not reach.
+  With D026 the captured copy is covered too: after the window neither the stored nor a
+  recorded copy of a prompt is recoverable.
 - Key pinning (the signed transcripts of §4) is a **demo trust assumption**: it
   only helps if the browser already holds the expected server identity via a
   trusted path. If the frontend JS that carries the pin is compromised, the
@@ -864,7 +925,7 @@ sweeper on every new connection (before building `history`) and on a periodic ta
 
 | Item | Held by | Readable by |
 |------|---------|-------------|
-| mnemonic → `browser_x25519` scalar | browser (derived on load) | browser only |
+| mnemonic → static X25519 scalar (storage identity, §2) | browser (derived on load); never on the channel (D026) | browser only |
 | `epoch_sk` (live epochs) | browser memory for the session; **sealed** copy on the server host (SQLite) | browser only |
 | records `{enc_r, ct_r}` | remote Postgres (TLS, `verify-full`) | browser only, and only while the epoch key exists |
 | `owner_ed25519`, `epoch_id`, `created_at` | server host + remote Postgres | server (metadata, by design) |
