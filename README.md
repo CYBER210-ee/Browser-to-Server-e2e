@@ -24,6 +24,23 @@ git checkout EchoSrv   # CYBER210, as submitted
 git checkout main      # CYBER212
 ```
 
+## Where CYBER212 is going: global deployment
+
+![EchoVault global deployment — echo servers on every continent, one RDS, the browser picks the server](docs/cyber212/cloud-deployment.svg)
+
+The CYBER212 target puts **echo servers in several regions of the world, all behind a reverse
+proxy and WAF, all filing sealed history into one central Amazon RDS**. The browser picks
+which echo server to talk to. That choice is the point: a prompt reaches the frontier-model
+clouds from the region of the echo server, not from the region of the person who typed it.
+The slide's example is a French user writing an English prompt — on its own that pairing is a
+fingerprint, and it is exactly the kind of thing an intermediary finds *interesting*. Routed
+through an echo server on another continent, the prompt carries that server's location, not
+the user's. Everything the CYBER212 branches already built carries over unchanged: each echo
+server has its own identity and its own TLS certificate, the browser pins the one it chose,
+history is per server and sealed before it leaves the page, and the shared database can
+decrypt nothing. The deck is at `docs/cyber212/Cloud_Deployment.pptx`; the plan and the
+foundation table are in [`docs/cyber212/README.md`](docs/cyber212/README.md).
+
 ## Architecture (CYBER212, today)
 
 ```

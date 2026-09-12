@@ -18,6 +18,14 @@ Living documents: `docs/protocol.md` (wire contract), `docs/threat-model.md`,
 
 ## Target architecture
 
+![Global deployment: echo servers across regions, one RDS, browser picks the server](cloud-deployment.svg)
+
+*From `Cloud_Deployment.pptx`.* Echo servers are deployed in several regions; the browser
+chooses one, so a prompt reaches the frontier-model clouds from the echo server's region
+rather than the user's (**location obfuscation** — the deck's French user writing an English
+prompt is the fingerprint being hidden). One Amazon RDS holds every server's sealed history.
+
+
 ```
                  public TLS                      per-server TLS (server CA, D030)
   Browser ───────────────────▶ Reverse proxy + WAF ──┬──▶ echo server A  (Ed25519 A · cert A · epoch keys A)
