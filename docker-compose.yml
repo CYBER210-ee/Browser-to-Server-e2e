@@ -1,0 +1,50 @@
+# ── EchoVault: client · server · history database ────────────────────────────
+# Three containers. The browser talks to the client on :3000 (http) and to the
+# echo server on :8443 (https/wss — the server terminates its own TLS, D030).
+# The database is included from db/ so the same definition runs alone elsewhere.
+#
+#   ./db/gen-db-certs.sh && cp db/.env.example db/.env               # edit password
+#   ./server/certs/gen-server-certs.sh                                # server CA + leaf; trust server-ca.crt in the browser
+#   cp server/.env.example server/.env                                # identity (python generate_keys.py) + DATABASE_URL
+#   docker compose up -d --build
+include:
+  - path: ./db/docker-compose.yml
+
+services:
+  server:
+    build: ./server
+    image: echovault-server:212
+    container_name: echo_server
+    restart: unless-stopped
+    env_file:
+      - ./server/.env              # SERVER_ED25519_PRIVATE_KEY_HEX, SERVER_NAME, DATABASE_URL, retention
+    environment:
+      DB_SSLROOTCERT: /app/certs/db-ca.crt
+      EPOCH_DB_PATH: /data/epoch_keys.sqlite3
+    volumes:
+      - ./db/certs/db-ca.crt:/app/certs/db-ca.crt:ro   # what verify-full trusts
+      - ./server/certs:/app/certs/tls:ro                 # this server's TLS leaf + the server CA (D030)
+      - epochkeys:/data                                  # sealed epoch keys stay on THIS host (D024/D031)
+    command: >
+      sh -c "exec uvicorn main:app --host 0.0.0.0 --port 8443
+             --ssl-keyfile /app/certs/tls/$${SERVER_NAME:-echovault}.key
+             --ssl-certfile /app/certs/tls/$${SERVER_NAME:-echovault}.crt"
+    ports:
+      - "8443:8443"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  client:
+    build:
+      context: ./client
+      args:
+        NEXT_PUBLIC_API_URL: https://localhost:8443    # baked into the bundle at build time
+    image: echovault-client:212
+    container_name: echo_client
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+
+volumes:
+  epochkeys:

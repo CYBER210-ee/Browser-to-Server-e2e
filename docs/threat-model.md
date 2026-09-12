@@ -14,12 +14,7 @@ This does not protect against the intended server reading the prompt. It also do
 
 ## Scope and Security Claim
 
-The demo compares two modes:
-
-1. **TLS-only mode:** prompt-like WebSocket traffic is protected by TLS in transit, but becomes visible wherever TLS terminates.
-2. **TLS + HPKE mode:** prompt-like WebSocket traffic is encrypted in the browser before being sent through the WebSocket.
-
-TLS still protects the transport, but HPKE adds an application-layer encryption boundary.
+The system has one mode: prompt-like WebSocket traffic is sealed in the browser (HPKE) before it enters the TLS-protected WebSocket, and every hop — browser to proxy, proxy to echo server — is TLS (D030). TLS protects the transport; HPKE adds an application-layer encryption boundary that survives TLS termination. The CYBER210 project also had a TLS-only comparison mode for a mitmproxy exhibit; it was removed in ADR 3 (D029) and is preserved at tag `EchoSrv`.
 
 In this project, “end-to-end” means **browser to intended echo server process**. The echo server is the intended recipient and decrypts the prompt by design. This is not end-to-end encryption in the messaging-app sense where only two human users can read the content. The server is trusted to decrypt and echo the message.
 
@@ -42,7 +37,7 @@ This threat model depends on the following assumptions:
 * The HPKE and AEAD libraries are implemented correctly and used according to their documentation.
 * The server's Ed25519 identity key is not stolen before or during the demo (theft afterwards no longer exposes recorded traffic, D026, but would allow impersonation).
 * The server public identity key used for pinning is known to the browser through a trusted demo path, such as a hardcoded pin or trusted local configuration.
-* mitmproxy represents a TLS-terminating intermediary, not a fully compromised browser or server.
+* The modeled intermediary is a TLS-terminating component (reverse proxy, WAF, gateway, inspection tool) that is not a fully compromised browser or server.
 * The demo uses fake prompt data only.
 * The goal is to protect prompt contents from intermediaries after TLS termination, not from the intended echo server.
 * The server erases expired epoch keys on schedule (D022). The browser cannot verify this; it is a stated trust assumption, the same one every disappearing-message system carries.
@@ -79,7 +74,7 @@ No real credentials, real PII, API keys, access tokens, or private project data 
 | L3    | Demo key-pinning handshake   | Pins expected server identity; binds **per-connection ephemeral recipient keys** to signed transcripts (`server_key`, `hello`, `server_hello`, protocol §4)                          |
 | L4    | HPKE seal/open               | RFC 9180 HPKE using X25519, HKDF-SHA-256, and ChaCha20-Poly1305                                                                                                                    |
 | L5    | Session and integrity checks | Sequence number, session id, **and frame type** bound in AAD; replay/reorder **enforced** — mandatory per-link `seq` tracking with teardown-and-rehandshake (protocol §7.3 / D019) |
-| L6    | Chat UI                      | Next.js/React interface with E2E ON/OFF toggle for comparison                                                                                                                      |
+| L6    | Chat UI                      | Next.js/React interface; every message is sealed (no plaintext mode, D029)                                                                                                         |
 | L7    | Stored history               | Prompt records HPKE-sealed in the browser to random epoch keys; epoch keys sealed to the mnemonic-derived identity key; expiry by server-side key erasure (protocol §9 / D021–D025)   |
 
 The main trust boundary is the echo server application process holding this connection's ephemeral HPKE private key and the Ed25519 identity key.
@@ -130,7 +125,7 @@ This project does not solve secure frontend code delivery.
 | Component                                   | Concern                                                                                  |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | Passive network observer / Wireshark        | Sees encrypted TLS records, IP/port, sizes, and timing, but not plaintext when TLS works |
-| mitmproxy with trusted CA installed         | Terminates TLS and can inspect WebSocket frames; named threat actor for this demo        |
+| TLS-terminating proxy with a trusted cert   | Terminates TLS and can inspect WebSocket frames; the modeled intermediary                |
 | Reverse proxy / load balancer / API gateway | Represents common TLS-terminating infrastructure                                         |
 | CDN edge node / WAF                         | May terminate TLS or inspect decrypted HTTP/WebSocket traffic in real deployments        |
 | Cloud infrastructure                        | May operate TLS termination, routing, inspection, and logging depending on deployment    |
@@ -147,7 +142,7 @@ These are two different threat positions and should not be conflated.
 
 A **passive observer**, such as Wireshark, watches packets without terminating TLS. When TLS is working, a passive observer sees encrypted TLS records, connection metadata, packet sizes, and timing. TLS already handles this case.
 
-A **TLS-terminating proxy** holds a certificate trusted by the browser or sits at an approved TLS termination point. It decrypts HTTPS or `wss://` traffic and can inspect application-layer data. In the demo, mitmproxy plays this role by using a trusted CA certificate.
+A **TLS-terminating proxy** holds a certificate trusted by the browser or sits at an approved TLS termination point. It decrypts HTTPS or `wss://` traffic and can inspect application-layer data. In the CYBER212 target this is the cloud reverse proxy and WAF in front of the echo servers.
 
 The project is about what happens at and after TLS termination, where prompt contents become visible in a TLS-only design.
 
@@ -158,7 +153,7 @@ The project is about what happens at and after TLS termination, where prompt con
 | Actor                                       | Capability                                                                                             | Position              |
 | ------------------------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------- |
 | Passive network observer                    | Captures packets but cannot break TLS                                                                  | Outside TLS tunnel    |
-| mitmproxy with trusted CA                   | Decrypts TLS and reads WebSocket frames                                                                | TLS termination point |
+| TLS-terminating proxy / WAF                 | Decrypts TLS and reads WebSocket frames                                                                | TLS termination point |
 | Reverse proxy / gateway / load balancer     | Terminates or forwards decrypted application traffic                                                   | Infrastructure layer  |
 | CDN / WAF / cloud inspection component      | May inspect decrypted traffic depending on deployment                                                  | Infrastructure layer  |
 | Compromised frontend/code-delivery attacker | Modifies browser-side JavaScript to access plaintext before encryption or alter cryptographic behavior | Code-delivery path    |
@@ -174,18 +169,18 @@ The project is about what happens at and after TLS termination, where prompt con
 
 ### Confidentiality
 
-| Threat                                        | E2E OFF: TLS only                                          | E2E ON: TLS + HPKE        | Mitigation                                                                |
-| --------------------------------------------- | ---------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------- |
-| Passive sniffer reads prompt                  | Hidden by TLS                                              | Hidden by TLS             | TLS 1.3 is sufficient for passive sniffing                                |
-| mitmproxy reads prompt                        | Visible after TLS termination                              | Sees HPKE ciphertext only | Browser seals prompt before sending                                       |
-| Reverse proxy / gateway reads prompt          | Visible if it receives decrypted traffic                   | Sees HPKE ciphertext only | Application-layer encryption moves plaintext boundary                     |
-| CDN / WAF / cloud TLS terminator reads prompt | Visible if it terminates TLS or inspects decrypted traffic | Sees HPKE ciphertext only | Same as above                                                             |
-| Server-side log captures prompt               | Possible after application receives plaintext              | Possible after HPKE open  | Log hygiene; outside crypto-layer protection                              |
-| Recorded traffic decrypted after a later key theft | n/a (already plaintext)                               | Unrecoverable             | Per-connection ephemeral recipient keys, wiped at teardown (protocol §4.0/§7.1, D026) |
-| Root/admin reads prompt from server memory    | Possible                                                   | Possible                  | Requires stronger isolation such as confidential computing; outside scope |
-| Server or DB operator reads stored history    | n/a (nothing stored)                                       | Sees sealed blobs only    | Records sealed in the browser to epoch keys; epoch keys sealed to the identity key (protocol §9 / D021) |
-| Stolen DB backup read after the window        | n/a                                                        | Unrecoverable             | Epoch key erased on the server host; backup holds ciphertext nothing can open (D022 / D024) |
-| Stolen mnemonic within the window             | n/a                                                        | Reads all live history    | Accepted: the identity key is static (D009); shorten `HISTORY_WINDOW` to bound it |
+| Threat                                        | Result with TLS + HPKE     | Mitigation                                                                |
+| --------------------------------------------- | -------------------------- | ------------------------------------------------------------------------- |
+| Passive sniffer reads prompt                  | Hidden by TLS              | TLS 1.3 on every hop (D030)                                               |
+| TLS-terminating proxy / WAF reads prompt      | Sees HPKE ciphertext only  | Browser seals prompt before sending; application-layer boundary            |
+| CDN / gateway / cloud TLS terminator reads prompt | Sees HPKE ciphertext only | Same as above                                                            |
+| Server-side log captures prompt               | Possible after HPKE open   | Log hygiene; outside crypto-layer protection                              |
+| Recorded traffic decrypted after a later key theft | Unrecoverable         | Per-connection ephemeral recipient keys, wiped at teardown (protocol §4.0/§7.1, D026) |
+| Root/admin reads prompt from server memory    | Possible                   | Requires stronger isolation such as confidential computing; outside scope |
+| Server or DB operator reads stored history    | Sees sealed blobs only     | Records sealed in the browser to epoch keys; epoch keys sealed to the identity key (protocol §9 / D021) |
+| Stolen DB backup read after the window        | Unrecoverable              | Epoch key erased on the server host; backup holds ciphertext nothing can open (D022 / D024) |
+| Echo server B reads history stored with A     | Cannot decrypt, does not serve | Epoch keys live on A's host only; records filed under `server_name` (D031) |
+| Stolen mnemonic within the window             | Reads all live history for that server | Accepted: the identity key is static (D009); shorten `HISTORY_WINDOW` to bound it |
 
 ### Integrity
 
@@ -355,11 +350,7 @@ These are important security problems, but they are separate from the narrow cla
 
 ### Confidentiality
 
-Confidentiality is the primary goal. The demo shows how HPKE inside TLS changes what a TLS-terminating intermediary can see.
-
-In TLS-only mode, mitmproxy can inspect plaintext WebSocket frames.
-
-In TLS + HPKE mode, mitmproxy should see only encrypted HPKE payloads.
+Confidentiality is the primary goal. HPKE inside TLS changes what a TLS-terminating intermediary can see: sealed frames only, never the prompt. Stored history extends the same boundary to the database: sealed blobs only, per server, and nothing at all once the epoch key is erased.
 
 ### Integrity
 
@@ -375,18 +366,37 @@ Availability is not addressed. The system may still be vulnerable to flooding, m
 
 ---
 
-## Expected Demo Evidence
+## Expected Evidence
 
 | Scenario                                | Expected Observation                                                                                  |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| TLS-only with passive sniffer           | Prompt not visible; encrypted TLS records only                                                        |
-| TLS-only with mitmproxy trusted CA      | Prompt visible in plaintext WebSocket frame                                                           |
-| TLS + HPKE with mitmproxy trusted CA    | Handshake frame shows `{ enc, sig }`; message frames show `{ seq, ct }`; prompt plaintext not visible |
-| TLS + HPKE echo reply through mitmproxy | Reply message frame shows `{ seq, ct }`; prompt plaintext not visible                                 |
-| Echo server after HPKE open             | Prompt visible to the intended server process                                                         |
+| Passive sniffer on any hop              | Encrypted TLS records only                                                                            |
+| TLS-terminating proxy, handshake        | `server_key` / `hello` / `server_hello` show ephemeral public keys, `enc`, `sig`; no prompt           |
+| TLS-terminating proxy, messages         | `{ seq, ct }` in both directions; prompt plaintext not visible                                        |
+| Echo server after HPKE open             | Prompt visible to the intended server process; stored record stays sealed                              |
+| Database and its backups                | Sealed records + metadata only; no epoch keys                                                          |
+| Same mnemonic, same server, new browser | History restored                                                                                       |
+| Same mnemonic, different server         | Empty history (D031)                                                                                   |
+| Epoch older than the window             | Sealed epoch key gone from the server host; records unrecoverable                                      |
+| Recording of a closed session + later key theft | Not decryptable (D026)                                                                        |
 | Tampered HPKE ciphertext                | Authentication failure; no corrupted plaintext echoed                                                 |
 | Replayed valid request                  | Rejected (enforced): `seq` gate fails, link torn down, fresh handshake required (D019)                |
 | Server logs                             | Plaintext should not appear in unexpected logs                                                        |
+
+Evidence from the CYBER210 mitmproxy exhibits (TLS-only vs TLS + HPKE) is preserved under `docs/cyber210/evidence/`.
+
+---
+
+## CYBER212 Direction
+
+The target deployment (see `docs/cyber212/README.md`) moves the trust boundaries, not the claims:
+
+* **Reverse proxy + WAF** in front terminate public TLS and re-encrypt to each echo server over the server's own certificate (D030). They are the modeled TLS-terminating intermediary; they see sealed frames and handshake public keys only.
+* **N echo servers**, each with its own Ed25519 identity, TLS certificate and sealed-epoch-key store. Each is a separate trust domain: a browser pins each server it uses, and history is per server (D031).
+* **One central database (RDS)** holding sealed records for every server, filed under `server_name`. It cannot decrypt anything; neither can its backups.
+* **Browser server selection**: the user picks an echo server; the pin list and the history it sees follow that choice.
+
+Open items for the cloud ADR: binding the server identity into the storage AAD, record timestamps from the database clock, the proxy's upstream verification against the server CA, and the operational side of per-server key and certificate provisioning.
 
 ---
 

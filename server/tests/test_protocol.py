@@ -440,3 +440,32 @@ def test_expired_epoch_makes_records_unrecoverable(server_keys, tmp_path, monkey
         link3.close()
     asyncio.run(go())
     svc.close()
+
+
+def test_history_is_per_server(server_keys, tmp_path):
+    """D031: the same mnemonic on server B sees nothing it stored with server A."""
+    records = MemoryRecordStore()                                      # the shared database
+    svc_a = HistoryService(EpochKeyStore(str(tmp_path / "a.sqlite3")), records, Policy(), "A")
+    svc_b = HistoryService(EpochKeyStore(str(tmp_path / "b.sqlite3")), records, Policy(), "B")
+
+    async def go():
+        seed = os.urandom(32)
+        b = PyBrowser(server_keys, seed)
+        link, _ = await connect(b, server_keys, svc_a)
+        epoch_id, frame = b.mint_epoch()
+        await link.send(frame)
+        await link.send(b.msg("only on A", epoch_id))
+        b.open(await link.recv(), "msg", H.TYPE_MSG)
+        link.close()
+
+        again = PyBrowser(server_keys, seed)
+        link_b, h = await connect(again, server_keys, svc_b)
+        assert h["epochs"] == [] and h["records"] == []
+        link_b.close()
+
+        back = PyBrowser(server_keys, seed)
+        link_a, _ = await connect(back, server_keys, svc_a)
+        assert back.restored_texts() == ["only on A"]
+        link_a.close()
+    asyncio.run(go())
+    svc_a.close(); svc_b.close()

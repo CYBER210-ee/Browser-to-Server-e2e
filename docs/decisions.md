@@ -251,6 +251,12 @@ Go, and Rust.
   **both implementations must compute the new AAD byte-identically or every `open()`
   fails** — so the D012 interop test MUST be re-run for the `TYPE` byte alongside
   `SESSION_ID`. Batched here with S4 so the contract re-freeze happens once.
+---
+
+> **Course boundary.** D001–D020 are the **CYBER210** baseline, frozen at tag `EchoSrv`
+> and preserved under `docs/cyber210/`. Everything from D021 on is **CYBER212** work on
+> `main`; the plan for the cloud is in `docs/cyber212/README.md`.
+
 ## Persistent History (ADR 212)
 
 ### D021 — History ownership: the mnemonic owns the history; server and database hold opaque blobs ✅
@@ -399,3 +405,46 @@ Go, and Rust.
   arrives (`server_key`), and the static X25519 key is once again a single-purpose key
   (D011): storage identity for the browser, nothing at all for the server. The old deployed
   demo is not a compatibility target (the proxy stack is retired in ADR 3).
+
+## CYBER212 Cleanup (ADR 3)
+
+### D029 — Plaintext mode removed entirely ✅
+- **Chose:** Delete `/ws/plain`, the Encrypt toggle, the plaintext wire mode and its
+  red-rendering path, and every E2E-OFF column in the docs. The secure link is the only
+  link.
+- **Rejected:** Keeping plaintext mode "for comparison". Its only purpose was the mitmproxy
+  exhibit (D005), and the proxy stack is gone (this ADR). A downgrade path with no exhibit
+  behind it is just a downgrade path.
+- **Why:** Less code in the receiver state machine, no `text`-vs-`ct` discriminator to get
+  wrong, and the threat model no longer has to describe a mode the system does not have.
+  The CYBER210 comparison survives at tag `EchoSrv`.
+
+### D030 — Every echo server terminates its own TLS ✅
+- **Chose:** uvicorn serves HTTPS/WSS on 8443 with a per-server certificate issued by a
+  project CA (`server/certs/gen-server-certs.sh`, SAN from `SERVER_NAME`). Plain HTTP is
+  removed, not made optional. In the cloud, the reverse proxy + WAF terminate public TLS and
+  **re-encrypt** to each echo server, verifying against this CA; locally the browser trusts
+  the CA directly.
+- **Rejected:** (a) Plain HTTP behind the proxy — the proxy-to-server hop would carry the
+  handshake and sealed frames in the clear inside the VPC, and the HPKE layer would be the
+  only thing between an internal observer and the metadata. (b) A sidecar TLS terminator per
+  server — one more container per server for something uvicorn already does.
+- **Why:** HPKE protects prompt content; TLS on every hop protects everything else (frame
+  metadata, pins on the wire, `/pubkey`) and is what a WAF needs to trust the upstream. A
+  cert per server also gives each echo server a second, transport-level identity that the
+  proxy can route on.
+
+### D031 — History is per echo server ✅
+- **Chose:** A browser that chatted with server A gets nothing back from server B. Sealed
+  epoch keys stay on each server's own host (D024, unchanged); records in the shared
+  database carry `server_name` and are filtered by it on read. Later (cloud ADR): bind the
+  server's Ed25519 identity into the storage AAD so a record from A cannot be opened in a
+  session with B even by a browser holding both keys.
+- **Rejected:** Shared history across servers — it would force the sealed epoch keys into a
+  shared store, which either loses the "the database cannot decrypt itself, backups
+  included" property of D024 or needs a second store with its own backup policy.
+- **Why:** The threat model wants each echo server to be a separate trust domain. Per-server
+  history falls out of the existing key placement for free: B never holds A's epoch keys, so
+  B cannot decrypt A's records even if it could read them. The `server_name` column exists
+  so B does not *serve* A's blobs either (counts and sizes are metadata). With one server it
+  is inert.

@@ -1,4 +1,4 @@
-# ── EchoVault history database (ADR 212 / D024) ──────────────────────────────
+# ── EchoVault history database (ADR 212 / D024, per-server records D031) ────
 # Holds ONLY sealed prompt records: blobs the browser sealed to per-epoch keys
 # that this box never sees. It can run anywhere — same host as the server or a
 # different one — because nothing here can decrypt what it stores. The link is

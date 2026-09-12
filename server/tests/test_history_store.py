@@ -101,13 +101,22 @@ def test_epoch_store_persists_across_reopen(tmp_path):
 def test_memory_records_recent_cap_and_delete():
     store = MemoryRecordStore()
     for i in range(5):
-        store.insert(OWNER_A, rec(EPOCH_1 if i < 3 else EPOCH_2, i, tag=bytes([i])))
-    store.insert(OWNER_B, rec(EPOCH_1, 99))
-    newest3 = store.recent(OWNER_A, 3)
+        store.insert("srv", OWNER_A, rec(EPOCH_1 if i < 3 else EPOCH_2, i, tag=bytes([i])))
+    store.insert("srv", OWNER_B, rec(EPOCH_1, 99))
+    newest3 = store.recent("srv", OWNER_A, 3)
     assert [r.created_at for r in newest3] == [2, 3, 4]              # oldest-first slice of the newest
-    assert store.delete_epoch(OWNER_A, EPOCH_1) == 3
-    assert [r.created_at for r in store.recent(OWNER_A, 10)] == [3, 4]
-    assert len(store.recent(OWNER_B, 10)) == 1
+    assert store.delete_epoch("srv", OWNER_A, EPOCH_1) == 3
+    assert [r.created_at for r in store.recent("srv", OWNER_A, 10)] == [3, 4]
+    assert len(store.recent("srv", OWNER_B, 10)) == 1
+
+
+def test_records_are_per_server():
+    """D031: a record filed with server A is invisible to, and undeletable by, server B."""
+    store = MemoryRecordStore()
+    store.insert("A", OWNER_A, rec(EPOCH_1, 1))
+    assert store.recent("B", OWNER_A, 10) == []
+    assert store.delete_epoch("B", OWNER_A, EPOCH_1) == 0
+    assert len(store.recent("A", OWNER_A, 10)) == 1
 
 
 # ── HistoryService ───────────────────────────────────────────────────────────
@@ -121,13 +130,13 @@ def test_service_sweep_erases_keys_and_cascades_records(epochs):
     svc = HistoryService(epochs, records, Policy(epoch_length_s=10, window_s=100, max_records=50))
     epochs.insert(OWNER_A, key(EPOCH_1, 0))
     epochs.insert(OWNER_A, key(EPOCH_2, 500))
-    records.insert(OWNER_A, rec(EPOCH_1, 5))
-    records.insert(OWNER_A, rec(EPOCH_2, 505))
+    records.insert("echovault", OWNER_A, rec(EPOCH_1, 5))
+    records.insert("echovault", OWNER_A, rec(EPOCH_2, 505))
 
     assert run(svc.sweep(now=99)) == 0
     assert run(svc.sweep(now=100)) == 1
     assert [k.epoch_id for k in epochs.live(OWNER_A)] == [EPOCH_2]
-    assert [r.epoch_id for r in records.recent(OWNER_A, 10)] == [EPOCH_2]
+    assert [r.epoch_id for r in records.recent("echovault", OWNER_A, 10)] == [EPOCH_2]
 
 
 def test_service_history_for_shape(epochs, monkeypatch):
@@ -168,8 +177,9 @@ def test_postgres_roundtrip():
     store = PostgresRecordStore(os.environ["DATABASE_URL"], os.environ.get("DB_SSLROOTCERT"))
     owner = os.urandom(32)
     for i in range(4):
-        store.insert(owner, rec(EPOCH_1 if i < 2 else EPOCH_2, i, tag=bytes([i])))
-    got = store.recent(owner, 3)
+        store.insert("test", owner, rec(EPOCH_1 if i < 2 else EPOCH_2, i, tag=bytes([i])))
+    got = store.recent("test", owner, 3)
     assert [r.created_at for r in got] == [1, 2, 3]
-    assert store.delete_epoch(owner, EPOCH_1) == 2
-    assert store.delete_epoch(owner, EPOCH_2) == 2
+    assert store.recent("other", owner, 3) == []                       # D031
+    assert store.delete_epoch("test", owner, EPOCH_1) == 2
+    assert store.delete_epoch("test", owner, EPOCH_2) == 2

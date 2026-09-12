@@ -2,7 +2,7 @@
 generate_keys.py — mint the server's Ed25519 identity.
 
 Prints the .env line and the browser pin. Run once, paste into server/.env
-(and echovault-deploy/echo_server/.env); never at server startup. There is no
+never at server startup. There is no
 static X25519 key any more (D026/D028): each connection mints its own.
 """
 
