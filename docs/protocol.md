@@ -13,7 +13,8 @@ signed transcript"; "monotonic sequence numbers [are] bound into AAD"; and
 "direction [is] bound into AAD", with **session context bound via a per-session
 `SESSION_ID` derived from the handshake transcripts (§3.0)** and the **message type
 bound into AAD (§3.0.1)** so a sealed message cannot be reflected into a different
-session or reinterpreted as a different frame kind.
+session or reinterpreted as a different frame kind. **Stored history** (ADR 212) is
+sealed in the browser to per-epoch keys and expires by server-side key erasure (§9).
 
 ---
 
@@ -33,6 +34,11 @@ The following are frozen decisions you must paste in verbatim.
 | 8 | Transcript layout server_hello | `"echovault/server_hello/v1"` | D013 |
 | 9 | `SESSION_ID` derivation | `SHA-256(T_hello ‖ T_server_hello)[:16]` — 16 bytes (§3.0) | D013 |
 | 10 | AAD message-type code | `msg = 0x01` (1 byte; `0x02`/`0x03` reserved for hello/server_hello, never sealed) — §3.0.1 | D020 |
+| 11 | AAD message-type codes, history frames | `epoch_key = 0x04` (c2s) · `history = 0x05` (s2c) — §3.0.1 | D023 |
+| 12 | Storage HPKE `info`, epoch key | `"echovault/epoch-key/v1"` — seals an epoch private key to the identity key (§9.2) | D022 |
+| 13 | Storage HPKE `info`, record | `"echovault/record/v1"` — seals a prompt record to an epoch public key (§9.3) | D022 |
+| 14 | Storage AAD | `owner_ed25519 (32) ‖ epoch_id (16)` = 48 bytes, both storage seals (§9.4) | D022 |
+| 15 | `epoch_id` | 16 random bytes, minted with the epoch keypair; base64url on the wire (§9.1) | D022 |
 
 ---
 
@@ -170,11 +176,16 @@ authenticated form.
 
 | Frame | `TYPE` code | Sealed? |
 |-------|-------------|---------|
-| `msg` | `0x01` | yes (AEAD-sealed; this is the only sealed frame type) |
+| `msg` | `0x01` | yes (AEAD-sealed, either direction) |
 | `hello` | `0x02` (reserved) | no (Ed25519-signed handshake frame, no AAD) |
 | `server_hello` | `0x03` (reserved) | no (Ed25519-signed handshake frame, no AAD) |
+| `epoch_key` | `0x04` | yes (AEAD-sealed, **c2s only** — §5.4.1, D023) |
+| `history` | `0x05` | yes (AEAD-sealed, **s2c only** — §5.4.2, D023) |
 
-- For every `msg`, `TYPE = 0x01`. The receiver reconstructs the AAD using the `TYPE`
+- For every `msg`, `TYPE = 0x01`; for `epoch_key`, `0x04`; for `history`, `0x05`. The
+  three sealed frame classes share one HPKE context (and one `seq` counter) per direction —
+  `TYPE` is what keeps a sealed `epoch_key` from ever opening as a `msg`, and vice versa.
+  The receiver reconstructs the AAD using the `TYPE`
   code for the frame class it **expects in the current state** (§5.6), *not* whatever
   the wire `type` string claims — if the wire `type` was flipped, the reconstructed
   AAD won't match what the sender sealed and `open()` fails.
@@ -200,7 +211,7 @@ AAD = STATE ‖ SESSION_ID ‖ DIRECTION ‖ TYPE ‖ SEQ8
 | `STATE` | `"echovault"` | ASCII bytes `65 63 68 6F 76 61 75 6C 74` | 9 |
 | `SESSION_ID` | `SHA-256(T_hello ‖ T_server_hello)[:16]` (§3.0) | raw bytes | 16 |
 | `DIRECTION` | `"c2s"` (browser→server) or `"s2c"` (server→browser) | ASCII bytes | 3 |
-| `TYPE` | frame-type code, `msg = 0x01` (§3.0.1) | 1 raw byte | 1 |
+| `TYPE` | frame-type code, `msg = 0x01` / `epoch_key = 0x04` / `history = 0x05` (§3.0.1) | 1 raw byte | 1 |
 | `SEQ8` | message counter | 8-byte **big-endian** unsigned | 8 |
 
 - **No separator bytes, no length prefixes.** Every segment is fixed-length, so
@@ -390,9 +401,9 @@ anywhere in EchoVault.**
 > Frames divide into two classes. **Handshake frames** (`GET /pubkey`
 > response, `hello`, `server_hello`) establish and authenticate the HPKE
 > contexts; they carry key material and signatures only and never carry
-> prompt content. **Encrypted payload frames** (`msg`) carry prompt content
-> exclusively as encrypted `ct`, only after the handshake completes **and the §4.1.1 /
-> §4.3.1 acceptance gates have passed**.
+> prompt content. **Encrypted payload frames** (`msg`, `epoch_key`, `history`) carry
+> prompt content and stored-history material exclusively as encrypted `ct`, only after
+> the handshake completes **and the §4.1.1 / §4.3.1 acceptance gates have passed**.
 
 ### 5.1 `GET /pubkey` → response
 
@@ -453,6 +464,68 @@ anywhere in EchoVault.**
 - The wire `type` here is routing convenience only; its **authenticated** form is the
   `TYPE = 0x01` byte inside the AAD (§3.0.1). A flipped wire `type` is caught by the
   state machine (§5.6) and, for a sealed frame, by AAD mismatch on `open()`.
+- **Plaintext contract (D023).** In the **c2s** direction the sealed plaintext is the
+  structured record carrier of §7.5 (`{ text, rec }`), not bare text. In the **s2c**
+  direction it remains the bare echo text. The frame shape is identical either way.
+
+### 5.4.1 `epoch_key`  (browser → server, sealed, `TYPE = 0x04`)
+
+Sent once per newly minted epoch, any time after the browser is ESTABLISHED and
+**before** the first `msg` that references that epoch. Shares the c2s `seq` counter
+with `msg`.
+
+```json
+{
+  "type": "epoch_key",
+  "seq":  "0000000000000002",  // HEX · shared c2s counter (§7.3)
+  "ct":   "…"                  // base64url · seal of the plaintext below, AAD TYPE = 0x04
+}
+```
+
+Sealed plaintext (UTF-8 JSON):
+
+```json
+{
+  "epoch": "…",   // base64url · 16-byte epoch_id (§9.1)
+  "enc":   "…",   // base64url · 32-byte HPKE enc of the identity-key seal (§9.2)
+  "ct":    "…"    // base64url · 48 bytes = sealed 32-byte epoch private scalar ‖ tag
+}
+```
+
+> The server stores `{epoch, enc, ct}` verbatim under the session's owner with its own
+> `created_at`. It MUST reject (§7.4) an `epoch` it already holds for that owner — a
+> repeated id is a replay or a client bug, never legitimate.
+
+### 5.4.2 `history`  (server → browser, sealed, `TYPE = 0x05`)
+
+Sent **exactly once**, immediately after `server_hello`, at **s2c `seq 0`**; echo
+replies therefore start at s2c `seq 1`. The browser MUST receive it (even with empty
+lists) before it is ESTABLISHED (§5.6).
+
+```json
+{
+  "type": "history",
+  "seq":  "0000000000000000",
+  "ct":   "…"                  // base64url · seal of the plaintext below, AAD TYPE = 0x05
+}
+```
+
+Sealed plaintext (UTF-8 JSON):
+
+```json
+{
+  "policy":  { "epoch_length_s": 3600, "window_s": 604800 },
+  "epochs":  [ { "epoch": "…", "created_at": 1757600000, "enc": "…", "ct": "…" } ],
+  "records": [ { "epoch": "…", "created_at": 1757600123, "enc": "…", "ct": "…" } ]
+}
+```
+
+- `epochs` are the owner's **live** sealed epoch keys (§9.2), oldest first. `records` are
+  the owner's stored prompt records (§9.3), oldest first, newest last, capped at
+  `HISTORY_MAX_RECORDS` (most recent kept). `created_at` is the **server** clock, UNIX
+  seconds — the server is the erasure authority (D022), so its clock defines expiry.
+- `policy` is informational for the browser's epoch-reuse rule (§9.5); the server enforces
+  erasure regardless of what the browser does with it.
 
 ### 5.5 No `iv` field — anywhere
 
@@ -471,21 +544,27 @@ dispatch into another handler):
 | Phase | Endpoint | Accepts | Rejects |
 |-------|----------|---------|---------|
 | `AWAIT_PUBKEY` | browser | `/pubkey` response | anything else |
-| `AWAIT_HELLO` | server | `hello` | `server_hello`, `msg`, unknown |
-| `AWAIT_SERVER_HELLO` | browser | `server_hello` | `hello`, `msg`, unknown |
-| `ESTABLISHED` | both | `msg` (only) | `hello`, `server_hello`, unknown |
+| `AWAIT_HELLO` | server | `hello` | `server_hello`, `msg`, `epoch_key`, unknown |
+| `AWAIT_SERVER_HELLO` | browser | `server_hello` | `hello`, `msg`, `history`, unknown |
+| `AWAIT_HISTORY` | browser | `history` (s2c `seq 0`) | `hello`, `server_hello`, `msg`, unknown |
+| `ESTABLISHED` | server | `msg`, `epoch_key` | `hello`, `server_hello`, `history`, unknown |
+| `ESTABLISHED` | browser | `msg` | `hello`, `server_hello`, `history`, `epoch_key`, unknown |
 
-- In `ESTABLISHED`, a frame that routes as anything but `msg` is a **fault**: it is not
-  passed to the HPKE context, and — consistent with the fail-closed policy of §7.3 — the
+- The server moves `AWAIT_HELLO → ESTABLISHED` in one step: it sends `server_hello` and
+  then, without waiting, the `history` push (§5.4.2). The browser has the extra
+  `AWAIT_HISTORY` phase because it must hold its epoch keys before it can seal a prompt.
+- In `ESTABLISHED`, a frame that routes as anything but the sealed types listed above is a
+  **fault**: it is not passed to the HPKE context, and — consistent with the fail-closed policy of §7.3 — the
   receiver **tears the link down and requires a fresh handshake** (it does *not*
   silently drop-and-continue). Rationale: with a single strictly-in-order context per
   direction, "dropping" a mid-stream frame would desync the counter anyway, so the very
   next legitimate `msg` would fail the `seq` gate and force teardown regardless — the
   honest, unambiguous behavior is to tear down immediately on the wrong-type frame.
-- For a legitimate `msg`, the receiver reconstructs the AAD with `TYPE = 0x01` (§3.0.1);
-  a wire `type` that was flipped to something else either never reaches `open()` (state
-  machine, above) or fails `open()` (AAD `TYPE` mismatch → teardown per §7.3) — belt and
-  suspenders.
+- For a legitimate sealed frame, the receiver reconstructs the AAD with the `TYPE` code
+  for the class the wire `type` claims **and that is legal in this phase** (`msg = 0x01`,
+  `epoch_key = 0x04`, `history = 0x05`, §3.0.1); a wire `type` that was flipped either
+  never reaches `open()` (state machine, above) or fails `open()` (AAD `TYPE` mismatch →
+  teardown per §7.3) — belt and suspenders.
 - Unknown / unexpected `type` values are a §7.4 uniform rejection (then teardown per
   §7.3), never a crash.
 - Note: this makes a wire-`type` flip another instance of the accepted teardown/DoS
@@ -507,13 +586,18 @@ MUST NOT appear on the wire.
 | `server_ed25519`, `browser_ed25519` | pubkey, hello | base64url, no pad |
 | `enc` | hello, server_hello | base64url, no pad |
 | `sig` | pubkey, hello, server_hello | base64url, no pad |
-| `ct` (ciphertext ‖ tag) | msg | base64url, no pad |
-| `seq` | msg | **lowercase hex**, 16 chars, zero-padded, big-endian |
+| `ct` (ciphertext ‖ tag) | msg, epoch_key, history | base64url, no pad |
+| `seq` | msg, epoch_key, history | **lowercase hex**, 16 chars, zero-padded, big-endian |
+| `epoch` (16-byte `epoch_id`) | sealed plaintexts of msg, epoch_key, history | base64url, no pad |
+| storage `enc` / `ct` (§9) | sealed plaintexts of msg, epoch_key, history | base64url, no pad |
+| `created_at` | history plaintext | JSON integer, UNIX seconds (server clock) |
 | `HKDF_SALT` | config / this doc | lowercase hex |
 | `INFO_X25519`, `INFO_ED25519` | key derivation | ASCII/UTF-8 bytes, verbatim (no base64) |
 | `STATE` (`"echovault"`), `DIRECTION` | inside AAD | ASCII bytes, verbatim (no base64) |
 | `SESSION_ID` | inside AAD (derived, §3.0) | raw bytes (SHA-256 truncated); never on the wire |
-| `TYPE` | inside AAD (derived, §3.0.1) | 1 raw byte (`msg = 0x01`); never on the wire |
+| `TYPE` | inside AAD (derived, §3.0.1) | 1 raw byte (`0x01` / `0x04` / `0x05`); never on the wire |
+| storage `info` strings (`"echovault/epoch-key/v1"`, `"echovault/record/v1"`) | storage HPKE setup (§9) | ASCII bytes, verbatim |
+| storage AAD (`owner_ed25519 ‖ epoch_id`) | storage seal/open (§9.4) | 48 raw bytes; never on the wire |
 | transcript labels (`"echovault/hello/v1"`, …) | inside signed bytes | ASCII bytes, verbatim |
 
 Rationale for the split: base64url is JSON/URL/header-safe; dropping padding
@@ -560,16 +644,18 @@ base nonce, and sequence counter internally.
 ### 7.2 Sealing / opening message `seq`
 
 ```
-aad       = STATE ‖ SESSION_ID ‖ DIRECTION ‖ 0x01 ‖ I2OSP(seq, 8)  # §3, TYPE=msg
+aad       = STATE ‖ SESSION_ID ‖ DIRECTION ‖ TYPE ‖ I2OSP(seq, 8)  # §3; TYPE = 0x01 msg,
+                                                                   #     0x04 epoch_key, 0x05 history
 ct        = ctx.seal(pt, aad) (recipient: ctx.open(ct, aad))
-wire      = { "type": "msg", "seq": hex(I2OSP(seq, 8)), "ct": base64url(ct) }
+wire      = { "type": <class>, "seq": hex(I2OSP(seq, 8)), "ct": base64url(ct) }
 ```
 
 `ct` is HPKE's AEAD output (ciphertext ‖ 16-byte tag). HPKE's internal sequence
 number starts at 0 and increments by one per `seal`/`open`; it selects the nonce
 automatically and it is never exposed. The `seq` we place in the AAD is the
 **app-level** counter (8-byte big-endian) and MUST track the context's internal
-sequence number one-for-one (both start at 0, both +1 per message per direction).
+sequence number one-for-one (both start at 0, both +1 per **sealed frame** per
+direction — `msg`, `epoch_key` and `history` all consume the same counter, D023).
 
 ### 7.3 seq, replay, and reordering — receiver enforcement (fix, D019)
 
@@ -626,6 +712,28 @@ The link-level consequence follows §7.3: under the chosen **teardown-and-rehand
 policy, **any** ordering fault (`seq` gate) or authentication fault (bad tag / AAD
 mismatch) tears the link down and requires a fresh handshake.
 
+### 7.5 c2s `msg` plaintext — the structured record carrier (D023)
+
+The browser→server `msg` plaintext is **UTF-8 JSON**, not bare text:
+
+```json
+{
+  "text": "My fake SSN is 123-45-6789",   // the prompt, exactly as typed
+  "rec": {                               // the SAME prompt, sealed for storage (§9.3)
+    "epoch": "…",   // base64url · 16-byte epoch_id the record was sealed under
+    "enc":   "…",   // base64url · 32-byte HPKE enc of the epoch-key seal
+    "ct":    "…"    // base64url · sealed record JSON ‖ 16-byte tag
+  }
+}
+```
+
+- The server echoes `"ECHO: " ‖ text` (bare text in the s2c `msg`, unchanged) and
+  stores `rec` verbatim under the owner. It never opens `rec`; it cannot.
+- A c2s `msg` whose plaintext is not this shape, whose `rec.epoch` the server does not hold
+  for this owner, or whose `rec` fields fail base64url/length checks is a **§7.4 fault**
+  (uniform rejection, teardown). There is no "text-only" fallback.
+- The server→browser `msg` plaintext stays bare text: echoes are not stored (D025).
+
 ---
 
 ## 8. What is and isn't protected (from `threat-model.md`)
@@ -660,6 +768,12 @@ mismatch) tears the link down and requires a fresh handshake.
   "stolen server private key" out of protection. Real forward secrecy is future work
   and requires per-epoch **ephemeral recipient** keys, not merely rotating the static
   identity (§7.3).
+- **Stored history (ADR 212, §9).** Records are sealed in the browser to random epoch
+  keys, and epoch keys to the mnemonic-derived identity key; the server and the database
+  hold opaque blobs. Expiry is the server **erasing** the sealed epoch key after
+  `HISTORY_WINDOW` — a trust assumption on the server, recorded in `threat-model.md`.
+  Until per-connection forward secrecy lands, a wire recording remains the one copy key
+  erasure does not reach.
 - Key pinning (the signed transcripts of §4) is a **demo trust assumption**: it
   only helps if the browser already holds the expected server identity via a
   trusted path. If the frontend JS that carries the pin is compromised, the
@@ -670,6 +784,94 @@ mismatch) tears the link down and requires a fresh handshake.
   extension) removes the server from the code-integrity trust path. This project
   documents code delivery as a residual limitation rather than solving it.
 
+## 9. Stored history — epoch keys and records (D021–D025)
+
+History is sealed **in the browser** to keys only the mnemonic holder can unlock; the
+server and the database store opaque blobs. Every storage operation is an HPKE
+**single-shot** seal/open in the §1 suite — no raw AEAD keys, no hand-managed nonces
+(D014). The static X25519 identity key of §2 is the root; the key tree is unchanged.
+
+### 9.1 Epoch
+
+An **epoch** is a random X25519 keypair plus a random 16-byte `epoch_id`, minted in the
+browser with the platform CSPRNG. Neither is derived from the mnemonic — anything derivable
+from the 24 words could be re-derived forever and so could never expire (D022).
+
+```
+epoch_id           = random(16)
+(epoch_sk, epoch_pk) = X25519 keypair, random
+```
+
+### 9.2 Sealing the epoch private key to the identity (`epoch_key` frame, §5.4.1)
+
+```
+enc_e, ct_e = Seal(pkR  = browser_x25519            (§2 static identity key),
+                   info = "echovault/epoch-key/v1",
+                   aad  = owner_ed25519 ‖ epoch_id  (§9.4),
+                   pt   = epoch_sk                   (32 raw bytes))
+```
+
+`ct_e` is 48 bytes (32 + 16-byte tag). The server stores `{epoch_id, enc_e, ct_e}` with
+its own `created_at`. Any browser that can derive `browser_x25519`'s private scalar from
+the mnemonic can open it: `epoch_sk = Open(skR = x25519_scalar, enc_e, info, aad, ct_e)`.
+
+### 9.3 Sealing a prompt record to the epoch (`rec` in the c2s `msg`, §7.5)
+
+```
+record      = UTF-8 JSON { "text": <prompt>, "ts": <browser UNIX ms> }
+enc_r, ct_r = Seal(pkR  = epoch_pk,
+                   info = "echovault/record/v1",
+                   aad  = owner_ed25519 ‖ epoch_id  (§9.4),
+                   pt   = record)
+```
+
+On replay the browser opens each record with the epoch private key recovered in §9.2:
+`record = Open(skR = epoch_sk, enc_r, info, aad, ct_r)`. A record whose epoch key is no
+longer held (erased, §9.5) is unrecoverable by construction and is not shown.
+
+### 9.4 Storage AAD — fixed layout
+
+```
+aad = owner_ed25519 (32 raw) ‖ epoch_id (16 raw)      = 48 bytes, no separators
+```
+
+`owner_ed25519` is the browser's static Ed25519 public key — the same bytes it puts in
+`hello` and the key the server files the blobs under. Binding it means a blob copied
+between owners, or a record re-filed under another epoch, fails `open()`. The AAD is
+reconstructed by the browser from values it already holds; it is never on the wire.
+
+### 9.5 Retention policy and erasure
+
+| Setting | Server `.env` | Default | Meaning |
+|---------|---------------|---------|---------|
+| epoch length | `EPOCH_LENGTH` | `1h` | the browser reuses the newest live epoch while `now − created_at < EPOCH_LENGTH`, otherwise mints a new one |
+| window | `HISTORY_WINDOW` | `7d` | the server **erases** a sealed epoch key once `now − created_at ≥ HISTORY_WINDOW` |
+| cap | `HISTORY_MAX_RECORDS` | `500` | most recent records included in the `history` push |
+
+Durations accept `s`, `m`, `h`, `d` suffixes. Consequences of the two timers: a record is
+**guaranteed unrecoverable** by `created_at(epoch) + HISTORY_WINDOW` and **kept for at
+least** `HISTORY_WINDOW − EPOCH_LENGTH`. The server also deletes the epoch's records on
+erasure, as hygiene — the guarantee comes from the key, not the rows. The server runs the
+sweeper on every new connection (before building `history`) and on a periodic task.
+
+> **Trust statement.** Expiry rests on the server erasing on schedule; the browser cannot
+> verify deletion. This is the same trust every disappearing-message system carries, and
+> it is recorded as a limitation in `threat-model.md`. What key erasure adds over row
+> deletion is reach: the remote database and any backup of it hold only records that
+> nothing in that location can decrypt (D024).
+
+### 9.6 Where the pieces live
+
+| Item | Held by | Readable by |
+|------|---------|-------------|
+| mnemonic → `browser_x25519` scalar | browser (derived on load) | browser only |
+| `epoch_sk` (live epochs) | browser memory for the session; **sealed** copy on the server host (SQLite) | browser only |
+| records `{enc_r, ct_r}` | remote Postgres (TLS, `verify-full`) | browser only, and only while the epoch key exists |
+| `owner_ed25519`, `epoch_id`, `created_at` | server host + remote Postgres | server (metadata, by design) |
+
+The browser persists **nothing** for history: with the words it re-obtains everything from
+the `history` push. On teardown it wipes every `epoch_sk` and the decrypted transcript.
+
 ## Expected public / non-secret endpoints
 
 These endpoints do not carry decrypted prompt content.
@@ -677,5 +879,5 @@ These endpoints do not carry decrypted prompt content.
 - `/api/health`
 - `/api/status`
 - `/pubkey` — public keys + transcript signature (§5.1); public by design
-- `/ws` — transport endpoint; prompt payloads appear only as encrypted
-  `ct` fields after handshake setup
+- `/ws` — transport endpoint; prompt payloads and stored-history material appear only
+  as encrypted `ct` fields after handshake setup (`msg`, `epoch_key`, `history`)

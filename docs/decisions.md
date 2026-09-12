@@ -249,3 +249,97 @@ Go, and Rust.
   **both implementations must compute the new AAD byte-identically or every `open()`
   fails** — so the D012 interop test MUST be re-run for the `TYPE` byte alongside
   `SESSION_ID`. Batched here with S4 so the contract re-freeze happens once.
+## Persistent History (ADR 212)
+
+### D021 — History ownership: the mnemonic owns the history; server and database hold opaque blobs ✅
+- **Chose:** Persist chat history, but seal every stored record **in the browser** to key
+  material that only the holder of the BIP-39 mnemonic can unlock. The echo server stores
+  and returns blobs it cannot open; the database stores blobs the server handed it. "Come
+  back with the same 24 words, get your history back" is the whole acceptance test.
+- **Rejected:** (a) A server-held storage key in `.env` — the server operator (or a leaked
+  `.env`) reads every conversation of every user forever, which widens exposure well past
+  D005's "the server sees the live prompt". (b) Storing the channel `ct` as received — it is
+  bound to one session's HPKE context, so reading it back means storing `enc`/`seq`, rebuilding
+  the recipient context from the server's static key, and opening in order from `seq 0`: a
+  feature built on the very non-forward-secrecy D009 calls a weakness, and useless for the
+  echo direction, which is sealed to the browser.
+- **Why:** This extends the project thesis one hop: browser-to-server encryption beyond
+  TLS becomes browser-to-storage encryption beyond the server. Per-user isolation is free
+  (every identity unlocks only its own blobs), there is no master key to rotate or lose, and a
+  compromise of the server host, the database host, or a backup yields ciphertext only. The
+  server's exposure stays exactly what it is today: the live prompt during a session.
+
+### D022 — Expiry by key erasure: random per-epoch keys, sealed to the identity key, erased after a window ✅
+- **Chose:** The browser mints a **random X25519 epoch keypair** every `EPOCH_LENGTH` and
+  HPKE-seals each prompt record to the current epoch public key. The epoch **private** key is
+  HPKE-sealed to the browser's static X25519 identity key (§2, unchanged key tree) and uploaded
+  once. The server **erases** the sealed epoch key once the epoch is older than
+  `HISTORY_WINDOW`; every record of that epoch is then unrecoverable wherever a copy lives.
+  All storage crypto is HPKE single-shot seal/open with distinct `info` strings, so D014
+  still holds: no hand-managed nonces or raw AEAD keys in the page.
+- **Rejected:** (a) Epoch keys **derived** from the mnemonic (HKDF + epoch index) — anything
+  derivable from the 24 words is re-derivable forever, so it can never expire. (b) A
+  hash-chain "forward ratchet" over epoch keys — a leaked head exposes every later epoch and
+  buys nothing that independent random keys don't. (c) Row deletion alone — deletes only the
+  copies you know about; backups and replicas keep the data. (d) A third HKDF branch feeding a
+  raw ChaCha20-Poly1305 key with random nonces — reintroduces manual nonce handling (D014).
+- **Why:** "Impossible to recover after T" always means *someone erased a secret at T*. A
+  ratchet does not make data expire; erasure does. What the epoch key buys is leverage:
+  erasing one 32-byte sealed blob kills every record of that epoch in every location,
+  including the remote database and any backup of it (crypto-shredding). Signal's disappearing
+  messages are a deletion timer, not a ratchet property; this design is the same honest
+  mechanism with a smaller thing to erase. A record is guaranteed gone by
+  `created + HISTORY_WINDOW` and alive for at least `HISTORY_WINDOW − EPOCH_LENGTH`.
+- **Tradeoff (accepted, documented in `threat-model.md`):** expiry rests on the **server
+  erasing on schedule** — the browser cannot verify deletion. Within the window a stolen
+  mnemonic reads everything (the identity key is static by D009). An epoch private key sits in
+  browser memory for the length of a session. A wire recording of the channel stays
+  recoverable via the server's static key until per-connection forward secrecy lands (next
+  ADR); the two are complementary halves of one claim.
+
+### D023 — Wire contract: record rides inside the sealed `msg`; new `epoch_key` (c2s) and `history` (s2c) frames ✅
+- **Chose:** The **c2s `msg` plaintext becomes structured JSON** — `{ text, rec }` — where
+  `rec` is the prompt already sealed to the epoch key. One seal, one frame: the server opens
+  the `msg` as today, echoes `text`, and stores `rec` under the owner (the `browser_ed25519`
+  proven by the `hello` signature). Two new **sealed** frame types: `epoch_key` (c2s,
+  `TYPE = 0x04`, any time in ESTABLISHED) carries a newly minted, identity-sealed epoch
+  private key; `history` (s2c, `TYPE = 0x05`) is pushed **once, immediately after
+  `server_hello`, at s2c `seq 0`**, carrying the retention policy, the live sealed epoch
+  keys, and the records. The browser MUST receive `history` (even empty) before it is
+  ESTABLISHED. Both new frames share the per-direction `seq` counters, because each HPKE
+  context is a single strictly-in-order stream (D014/D019).
+- **Rejected:** (a) A separate per-record upload frame — the prompt would cross the wire
+  twice. (b) An authenticated REST endpoint for history — a second auth path beside the
+  handshake, and history would leave the HPKE channel. (c) Browser-requested history
+  (`history_req`) — one more frame type for no gain; the server always knows to push.
+- **Why:** The `msg` frame is already the authenticated, sealed, in-order carrier for the
+  prompt; adding the record to its plaintext costs bytes, not trust. Pushing history right
+  after `server_hello` means the browser has its epoch keys before it can seal its first
+  prompt, so "reuse the live epoch or mint a new one" is decided with full information.
+- **Cost / ripple (paid deliberately):** this amends the **frozen contract** (D013): §0 gains
+  storage constants, §3.0.1 gains two TYPE codes, §5 gains two frame shapes, §5.6 gains
+  `AWAIT_HISTORY`, and §7 gains the structured c2s plaintext. Both implementations must build
+  the new AADs byte-identically or every `open()` fails.
+
+### D024 — Split stores: sealed epoch keys on the server host, records in a remote Postgres over TLS ✅
+- **Chose:** Two stores behind one small interface. **Sealed epoch keys** live on the server
+  host in a SQLite file on a volume (stdlib, no dependency); **records** live in a
+  **Postgres container that may run anywhere**, reached with `sslmode=verify-full` against a
+  self-signed CA generated the same way as the existing demo certs. The expiry sweeper runs
+  on the server, on every connection and on a timer.
+- **Rejected:** (a) Keys and records in the same Postgres — a backup of that database carries
+  both halves, so "erase the key" no longer beats "delete the rows". (b) Plain TCP to Postgres,
+  relying on the blobs being opaque — owner keys, epoch ids and timestamps would cross the link
+  in the clear. (c) SQLite behind a bespoke HTTP service — more code for less capability.
+- **Why:** The remote location, and every backup of it, holds ciphertext that nothing *in that
+  location* can decrypt. The erasure authority sits on the box the operator controls. The
+  interface boundary is what makes the database swappable without touching the protocol.
+
+### D025 — Echoes are not stored; the browser reconstructs them on replay ✅
+- **Chose:** Persist prompts only. On replay the browser renders `ECHO: <text>` for each
+  restored prompt, labelled as restored.
+- **Rejected:** (a) The browser sealing the echo after receipt and uploading it — a second
+  upload per message, the exact cost D023 avoids. (b) The server storing echoes under a key of
+  its own — reintroduces the server-held key D021 rejects, for one direction only.
+- **Why:** The echo server is deterministic, so the stored prompt *is* the echo. When a real
+  reply-producing backend replaces the echo, this entry is the one to revisit.

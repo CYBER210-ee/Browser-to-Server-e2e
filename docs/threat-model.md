@@ -25,7 +25,9 @@ In this project, “end-to-end” means **browser to intended echo server proces
 
 **The claim is narrow:** HPKE inside TLS reduces plaintext exposure at TLS-terminating intermediaries that are not the intended reader of the prompt.
 
-**The claim is not:** This system does not hide the prompt from the echo server, a compromised browser, compromised frontend JavaScript, a stolen server private key, server-side logs after decryption, or anyone with privileged access to the server process or host.
+**The storage claim (ADR 212, D021–D025) is equally narrow:** stored chat history can be read only by the holder of the BIP-39 mnemonic, never by the echo server, the database, or anyone holding a copy of either; and a record becomes unrecoverable everywhere once the server erases its epoch key at the end of the retention window.
+
+**The claim is not:** This system does not hide the prompt from the echo server, a compromised browser, compromised frontend JavaScript, a stolen server private key, server-side logs after decryption, or anyone with privileged access to the server process or host. It does not hide *stored* history from anyone holding the mnemonic within the window, and it does not prove to the browser that erasure happened.
 
 ---
 
@@ -41,6 +43,8 @@ This threat model depends on the following assumptions:
 * mitmproxy represents a TLS-terminating intermediary, not a fully compromised browser or server.
 * The demo uses fake prompt data only.
 * The goal is to protect prompt contents from intermediaries after TLS termination, not from the intended echo server.
+* The server erases expired epoch keys on schedule (D022). The browser cannot verify this; it is a stated trust assumption, the same one every disappearing-message system carries.
+* The server's clock is the authority for `created_at` and therefore for expiry.
 
 ---
 
@@ -52,6 +56,7 @@ Both directions are test points for the demo:
 
 * Browser to server: user prompt sealed under HPKE.
 * Server to browser: echo reply sealed under HPKE.
+* At rest: the same prompt as a **stored history record**, sealed in the browser to a per-epoch key that only the mnemonic holder can unlock (protocol §9). The echo is not stored (D025).
 
 The demo must use fake values only, such as:
 
@@ -73,6 +78,7 @@ No real credentials, real PII, API keys, access tokens, or private project data 
 | L4    | HPKE seal/open               | RFC 9180 HPKE using X25519, HKDF-SHA-256, and ChaCha20-Poly1305                                                                                                                    |
 | L5    | Session and integrity checks | Sequence number, session id, **and frame type** bound in AAD; replay/reorder **enforced** — mandatory per-link `seq` tracking with teardown-and-rehandshake (protocol §7.3 / D019) |
 | L6    | Chat UI                      | Next.js/React interface with E2E ON/OFF toggle for comparison                                                                                                                      |
+| L7    | Stored history               | Prompt records HPKE-sealed in the browser to random epoch keys; epoch keys sealed to the mnemonic-derived identity key; expiry by server-side key erasure (protocol §9 / D021–D025)   |
 
 The main trust boundary is the echo server application process holding the HPKE private key `skB`.
 
@@ -81,6 +87,8 @@ When E2E is ON, network observers and TLS-terminating intermediaries should see 
 (`enc` is carried once per direction in the handshake, not in every message — protocol.md §5.)
 
 Plaintext still exists inside the intended echo server process after HPKE decryption and may be exposed through server memory, debug output, application logs, crash dumps, or privileged host access.
+
+Stored history never exists in plaintext outside the browser. The server files sealed blobs under the owner's Ed25519 key; sealed epoch keys stay on the server host, and records go to a Postgres that may run anywhere, over TLS (D024). Nothing in the database location can decrypt what it holds.
 
 ---
 
@@ -92,6 +100,7 @@ There are two important channels in this system.
 | --------------------- | ---------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Data channel          | WebSocket frames such as `hello` and `msg(seq, ct)`  | FastAPI `:8000` | TLS plus HPKE when E2E is ON                                                                                                        |
 | Code-delivery channel | HTML and JavaScript that run the browser-side crypto | Next.js `:3000` | Not protected by HPKE; relies on normal web code-delivery trust such as HTTPS, trusted local development, and untampered JavaScript |
+| Storage channel       | Sealed epoch keys and prompt records (`epoch_key`, `history`, `rec` inside `msg`) | FastAPI `:8000` → SQLite on the server host + Postgres `:5432` | HPKE to the browser's own keys (opaque to the server); TLS `verify-full` on the Postgres link; erasure of epoch keys after the window |
 
 The data channel is what this project protects.
 
@@ -112,6 +121,7 @@ This project does not solve secure frontend code delivery.
 | Echo server application process             | Intended HPKE recipient; sees plaintext by design                                                   |
 | Server-side crypto code                     | Performs HPKE open and seal-back                                                                    |
 | Expected server public identity key         | Used to detect unexpected key substitution in the demo handshake                                    |
+| Server-side expiry sweeper                  | Trusted to erase expired epoch keys on schedule; the only party that can make history expire        |
 
 ### Less Trusted / Observable
 
@@ -124,6 +134,8 @@ This project does not solve secure frontend code delivery.
 | Cloud infrastructure                        | May operate TLS termination, routing, inspection, and logging depending on deployment    |
 | Host OS and admin layer                     | Privileged access can expose plaintext after HPKE decryption                             |
 | Server-side logging layer                   | May accidentally capture plaintext after HPKE open                                       |
+| Postgres container / host (may be remote)   | Holds sealed records and metadata (owner key, epoch id, timestamps); cannot decrypt them |
+| Database backups and replicas               | Same as above; made harmless by epoch-key erasure rather than by deletion                |
 
 ---
 
@@ -168,6 +180,9 @@ The project is about what happens at and after TLS termination, where prompt con
 | CDN / WAF / cloud TLS terminator reads prompt | Visible if it terminates TLS or inspects decrypted traffic | Sees HPKE ciphertext only | Same as above                                                             |
 | Server-side log captures prompt               | Possible after application receives plaintext              | Possible after HPKE open  | Log hygiene; outside crypto-layer protection                              |
 | Root/admin reads prompt from server memory    | Possible                                                   | Possible                  | Requires stronger isolation such as confidential computing; outside scope |
+| Server or DB operator reads stored history    | n/a (nothing stored)                                       | Sees sealed blobs only    | Records sealed in the browser to epoch keys; epoch keys sealed to the identity key (protocol §9 / D021) |
+| Stolen DB backup read after the window        | n/a                                                        | Unrecoverable             | Epoch key erased on the server host; backup holds ciphertext nothing can open (D022 / D024) |
+| Stolen mnemonic within the window             | n/a                                                        | Reads all live history    | Accepted: the identity key is static (D009); shorten `HISTORY_WINDOW` to bound it |
 
 ### Integrity
 
@@ -179,6 +194,8 @@ The project is about what happens at and after TLS termination, where prompt con
 | Replay or reordering                                   | **Rejected (enforced).** A duplicate/rollback/gap fails the `seq` gate; the link is torn down and a fresh handshake is required                                                                                               | Monotonic sequence numbers bound into AAD + **mandatory** receiver `seq` tracking with teardown-and-rehandshake (protocol §7.3 / D019)                                                                                                                                                    |
 | Reflection across direction or session                 | Reflected message should fail authentication                                                                                                                                                                                  | Direction bound into AAD; **session bound via `SESSION_ID` (SHA-256 of the handshake transcripts) in AAD** (protocol §3.0). Cross-direction reflection fails on the direction token; cross-session reflection fails because the session's derived key differs *and* `SESSION_ID` differs. |
 | Frame-type confusion (e.g. `msg` relabeled as `hello`) | Reinterpretation rejected                                                                                                                                                                                                     | 1-byte `TYPE` bound into AAD + strict receiver state machine that only accepts the frame type valid for the current phase (protocol §3.0.1 / §5.6 / D020)                                                                                                                                 |
+| Stored record or epoch key moved between owners or epochs | `open()` fails in the browser; the record is not shown                                                                                                                                                                     | Storage AAD binds `owner_ed25519 ‖ epoch_id` into every storage seal (protocol §9.4)                                                                                                                                                                                                      |
+| Replayed `epoch_key` upload                            | Rejected; link torn down                                                                                                                                                                                                      | Server refuses an `epoch_id` it already holds for that owner (protocol §5.4.1)                                                                                                                                                                                                            |
 | Malformed ciphertext                                   | Malformed input should be rejected without exposing plaintext or sensitive internal details; testing confirmed fail-closed rejection but identified internal exception detail in some error paths                             | Strict, uniform fail-closed handling with sanitized errors that do not expose plaintext or internal implementation details (protocol §7.4 / D018)                                                                                                                                         |
 
 ### Availability
@@ -261,7 +278,23 @@ The key-pinning handshake is useful for demonstrating key authenticity, but it i
 
 Production systems would need stronger decisions around provisioning, rotation, revocation, storage, and user/device identity.
 
-Because identity keys are static (D009), there is **no forward secrecy against long-term-key compromise** in either direction; adding per-epoch ephemeral recipient keys is future work.
+Because identity keys are static (D009), there is **no forward secrecy against long-term-key compromise** in either direction; adding per-connection ephemeral recipient keys is the next ADR. Until it lands, a **wire recording** of a session stays recoverable by whoever later obtains the server's static X25519 key — key erasure (below) covers the stored copy, not the captured one. The two are complementary halves of one claim.
+
+### Expiry Is a Server Promise
+
+History records become unrecoverable when the server erases the sealed epoch key at the end of `HISTORY_WINDOW` (protocol §9.5). The browser cannot verify that the erasure happened. A server that keeps the sealed keys keeps nothing it can read itself, but it keeps the ability of a future mnemonic holder to read old records.
+
+What erasure buys over row deletion is reach: the remote database and every backup of it hold only records that nothing in that location can decrypt.
+
+### Stored History Is Only as Secret as the Mnemonic
+
+Within the window, anyone holding the 24 words can open every live epoch key and therefore every live record. The identity key is static by design (D009). Shortening `HISTORY_WINDOW` bounds the exposure; nothing else does.
+
+An epoch private key also sits in browser memory for the length of a session. A compromised page (see Code Delivery) reads it as easily as it reads the prompt.
+
+### Storage Metadata Is Visible to the Server and the Database
+
+The owner's Ed25519 public key, epoch ids, record timestamps, record counts and sizes are stored in the clear on the server host and in Postgres. They reveal *who* talked, *when*, and *how much*, not *what*.
 
 ### Metadata Is Still Visible
 
@@ -298,6 +331,9 @@ The following are outside the protection provided by this demo:
 * Compromised npm dependency
 * Tampered JavaScript bundle
 * Server private key theft
+* Mnemonic theft within the retention window
+* A server that does not erase expired epoch keys
+* Deleting individual records on demand, and pagination of long histories
 * Root or administrator access to the server
 * Production key management
 * Long-term key rotation and revocation
