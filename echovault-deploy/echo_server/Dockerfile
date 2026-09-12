@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # hpke_server.py is the crypto core imported by main.py
-COPY main.py hpke_server.py .env .
+COPY main.py hpke_server.py secure_link.py history_store.py .env .
 # Listens on 8000 inside the container (reachable as server:8000 on proxynet).
 EXPOSE 8000
 # 0.0.0.0 so the proxy container can reach it. No --reload in production.

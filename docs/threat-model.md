@@ -25,7 +25,11 @@ In this project, “end-to-end” means **browser to intended echo server proces
 
 **The claim is narrow:** HPKE inside TLS reduces plaintext exposure at TLS-terminating intermediaries that are not the intended reader of the prompt.
 
-**The claim is not:** This system does not hide the prompt from the echo server, a compromised browser, compromised frontend JavaScript, a stolen server private key, server-side logs after decryption, or anyone with privileged access to the server process or host.
+**The storage claim (ADR 212, D021–D025) is equally narrow:** stored chat history can be read only by the holder of the BIP-39 mnemonic, never by the echo server, the database, or anyone holding a copy of either; and a record becomes unrecoverable everywhere once the server erases its epoch key at the end of the retention window.
+
+**The channel claim (ADR 2, D026–D028):** both HPKE directions seal to per-connection ephemeral keys that are wiped at teardown, so a recording of the wire cannot be decrypted with any key that survives the connection — theft of either static identity key *after* a session reveals nothing from it.
+
+**The claim is not:** This system does not hide the prompt from the echo server, a compromised browser, compromised frontend JavaScript, a server private key stolen *during* a live session, server-side logs after decryption, or anyone with privileged access to the server process or host. A stolen identity key still allows impersonation from then on. It does not hide *stored* history from anyone holding the mnemonic within the window, and it does not prove to the browser that erasure happened.
 
 ---
 
@@ -36,11 +40,13 @@ This threat model depends on the following assumptions:
 * The browser initially receives the intended demo frontend code.
 * The delivered JavaScript is trusted for the purpose of the demo.
 * The HPKE and AEAD libraries are implemented correctly and used according to their documentation.
-* The server private key is not stolen before or during the demo.
+* The server's Ed25519 identity key is not stolen before or during the demo (theft afterwards no longer exposes recorded traffic, D026, but would allow impersonation).
 * The server public identity key used for pinning is known to the browser through a trusted demo path, such as a hardcoded pin or trusted local configuration.
 * mitmproxy represents a TLS-terminating intermediary, not a fully compromised browser or server.
 * The demo uses fake prompt data only.
 * The goal is to protect prompt contents from intermediaries after TLS termination, not from the intended echo server.
+* The server erases expired epoch keys on schedule (D022). The browser cannot verify this; it is a stated trust assumption, the same one every disappearing-message system carries.
+* The server's clock is the authority for `created_at` and therefore for expiry.
 
 ---
 
@@ -52,6 +58,7 @@ Both directions are test points for the demo:
 
 * Browser to server: user prompt sealed under HPKE.
 * Server to browser: echo reply sealed under HPKE.
+* At rest: the same prompt as a **stored history record**, sealed in the browser to a per-epoch key that only the mnemonic holder can unlock (protocol §9). The echo is not stored (D025).
 
 The demo must use fake values only, such as:
 
@@ -68,19 +75,22 @@ No real credentials, real PII, API keys, access tokens, or private project data 
 | Layer | Component                    | Role                                                                                                                                                                               |
 | ----- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | L1    | TLS 1.3 over `wss://`        | Outer transport tunnel; may terminate at a proxy                                                                                                                                   |
-| L2    | Demo identity material       | BIP-39 mnemonic used for repeatable demo identity and testing                                                                                                                      |
-| L3    | Demo key-pinning handshake   | Pins expected server identity; binds key material to a signed transcript                                                                                                           |
+| L2    | Demo identity material       | BIP-39 mnemonic → Ed25519 (signs the handshake) + static X25519 (storage identity only, D026)                                                                                      |
+| L3    | Demo key-pinning handshake   | Pins expected server identity; binds **per-connection ephemeral recipient keys** to signed transcripts (`server_key`, `hello`, `server_hello`, protocol §4)                          |
 | L4    | HPKE seal/open               | RFC 9180 HPKE using X25519, HKDF-SHA-256, and ChaCha20-Poly1305                                                                                                                    |
 | L5    | Session and integrity checks | Sequence number, session id, **and frame type** bound in AAD; replay/reorder **enforced** — mandatory per-link `seq` tracking with teardown-and-rehandshake (protocol §7.3 / D019) |
 | L6    | Chat UI                      | Next.js/React interface with E2E ON/OFF toggle for comparison                                                                                                                      |
+| L7    | Stored history               | Prompt records HPKE-sealed in the browser to random epoch keys; epoch keys sealed to the mnemonic-derived identity key; expiry by server-side key erasure (protocol §9 / D021–D025)   |
 
-The main trust boundary is the echo server application process holding the HPKE private key `skB`.
+The main trust boundary is the echo server application process holding this connection's ephemeral HPKE private key and the Ed25519 identity key.
 
-When E2E is ON, network observers and TLS-terminating intermediaries should see only encrypted HPKE payloads. Handshake frames expose key material (`enc`) and a signature (`sig`); steady-state message frames expose only `{ seq, ct }` (prompt plaintext never appears).
+When E2E is ON, network observers and TLS-terminating intermediaries should see only encrypted HPKE payloads. Handshake frames expose public key material (ephemeral recipient keys, `enc`) and signatures; steady-state message frames expose only `{ seq, ct }` (prompt plaintext never appears).
 
 (`enc` is carried once per direction in the handshake, not in every message — protocol.md §5.)
 
 Plaintext still exists inside the intended echo server process after HPKE decryption and may be exposed through server memory, debug output, application logs, crash dumps, or privileged host access.
+
+Stored history never exists in plaintext outside the browser. The server files sealed blobs under the owner's Ed25519 key; sealed epoch keys stay on the server host, and records go to a Postgres that may run anywhere, over TLS (D024). Nothing in the database location can decrypt what it holds.
 
 ---
 
@@ -92,6 +102,7 @@ There are two important channels in this system.
 | --------------------- | ---------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Data channel          | WebSocket frames such as `hello` and `msg(seq, ct)`  | FastAPI `:8000` | TLS plus HPKE when E2E is ON                                                                                                        |
 | Code-delivery channel | HTML and JavaScript that run the browser-side crypto | Next.js `:3000` | Not protected by HPKE; relies on normal web code-delivery trust such as HTTPS, trusted local development, and untampered JavaScript |
+| Storage channel       | Sealed epoch keys and prompt records (`epoch_key`, `history`, `rec` inside `msg`) | FastAPI `:8000` → SQLite on the server host + Postgres `:5432` | HPKE to the browser's own keys (opaque to the server); TLS `verify-full` on the Postgres link; erasure of epoch keys after the window |
 
 The data channel is what this project protects.
 
@@ -112,6 +123,7 @@ This project does not solve secure frontend code delivery.
 | Echo server application process             | Intended HPKE recipient; sees plaintext by design                                                   |
 | Server-side crypto code                     | Performs HPKE open and seal-back                                                                    |
 | Expected server public identity key         | Used to detect unexpected key substitution in the demo handshake                                    |
+| Server-side expiry sweeper                  | Trusted to erase expired epoch keys on schedule; the only party that can make history expire        |
 
 ### Less Trusted / Observable
 
@@ -124,6 +136,8 @@ This project does not solve secure frontend code delivery.
 | Cloud infrastructure                        | May operate TLS termination, routing, inspection, and logging depending on deployment    |
 | Host OS and admin layer                     | Privileged access can expose plaintext after HPKE decryption                             |
 | Server-side logging layer                   | May accidentally capture plaintext after HPKE open                                       |
+| Postgres container / host (may be remote)   | Holds sealed records and metadata (owner key, epoch id, timestamps); cannot decrypt them |
+| Database backups and replicas               | Same as above; made harmless by epoch-key erasure rather than by deletion                |
 
 ---
 
@@ -167,18 +181,24 @@ The project is about what happens at and after TLS termination, where prompt con
 | Reverse proxy / gateway reads prompt          | Visible if it receives decrypted traffic                   | Sees HPKE ciphertext only | Application-layer encryption moves plaintext boundary                     |
 | CDN / WAF / cloud TLS terminator reads prompt | Visible if it terminates TLS or inspects decrypted traffic | Sees HPKE ciphertext only | Same as above                                                             |
 | Server-side log captures prompt               | Possible after application receives plaintext              | Possible after HPKE open  | Log hygiene; outside crypto-layer protection                              |
+| Recorded traffic decrypted after a later key theft | n/a (already plaintext)                               | Unrecoverable             | Per-connection ephemeral recipient keys, wiped at teardown (protocol §4.0/§7.1, D026) |
 | Root/admin reads prompt from server memory    | Possible                                                   | Possible                  | Requires stronger isolation such as confidential computing; outside scope |
+| Server or DB operator reads stored history    | n/a (nothing stored)                                       | Sees sealed blobs only    | Records sealed in the browser to epoch keys; epoch keys sealed to the identity key (protocol §9 / D021) |
+| Stolen DB backup read after the window        | n/a                                                        | Unrecoverable             | Epoch key erased on the server host; backup holds ciphertext nothing can open (D022 / D024) |
+| Stolen mnemonic within the window             | n/a                                                        | Reads all live history    | Accepted: the identity key is static (D009); shorten `HISTORY_WINDOW` to bound it |
 
 ### Integrity
 
 | Threat                                                 | Expected Result                                                                                                                                                                                                               | Mitigation                                                                                                                                                                                                                                                                                |
 | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Ciphertext tampering                                   | Message should fail authentication and be rejected                                                                                                                                                                            | ChaCha20-Poly1305 AEAD authentication                                                                                                                                                                                                                                                     |
-| Key substitution — **server key (c2s)**                | Browser detects an unexpected server identity key via the pinned Ed25519 identity and aborts                                                                                                                                  | Pinned Ed25519 handshake + mandatory `/pubkey` pin-comparison gate (protocol §4.1.1 / D016)                                                                                                                                                                                               |
+| Key substitution — **server key (c2s)**                | Browser detects an unexpected server identity key via the pinned Ed25519 identity and aborts; a substituted server *ephemeral* fails the `server_key` signature check                                                          | Pinned Ed25519 handshake + mandatory `/pubkey` pin-comparison gate + `server_key` gate (protocol §4.1.1 / §4.0.1 / D016 / D027)                                                                                                                                                             |
 | Key substitution — **browser key (s2c reply)**         | Browser detects an unexpected `browser_x25519` in the reply path (an active proxy trying to redirect the echo, which carries the prompt back) via the `server_hello` self-key check, and aborts **before sealing any prompt** | Mandatory `server_hello` acceptance gate: verify sig against pin **and** assert own browser/server keys echoed byte-for-byte (protocol §4.3.1 / D015)                                                                                                                                     |
 | Replay or reordering                                   | **Rejected (enforced).** A duplicate/rollback/gap fails the `seq` gate; the link is torn down and a fresh handshake is required                                                                                               | Monotonic sequence numbers bound into AAD + **mandatory** receiver `seq` tracking with teardown-and-rehandshake (protocol §7.3 / D019)                                                                                                                                                    |
 | Reflection across direction or session                 | Reflected message should fail authentication                                                                                                                                                                                  | Direction bound into AAD; **session bound via `SESSION_ID` (SHA-256 of the handshake transcripts) in AAD** (protocol §3.0). Cross-direction reflection fails on the direction token; cross-session reflection fails because the session's derived key differs *and* `SESSION_ID` differs. |
 | Frame-type confusion (e.g. `msg` relabeled as `hello`) | Reinterpretation rejected                                                                                                                                                                                                     | 1-byte `TYPE` bound into AAD + strict receiver state machine that only accepts the frame type valid for the current phase (protocol §3.0.1 / §5.6 / D020)                                                                                                                                 |
+| Stored record or epoch key moved between owners or epochs | `open()` fails in the browser; the record is not shown                                                                                                                                                                     | Storage AAD binds `owner_ed25519 ‖ epoch_id` into every storage seal (protocol §9.4)                                                                                                                                                                                                      |
+| Replayed `epoch_key` upload                            | Rejected; link torn down                                                                                                                                                                                                      | Server refuses an `epoch_id` it already holds for that owner (protocol §5.4.1)                                                                                                                                                                                                            |
 | Malformed ciphertext                                   | Malformed input should be rejected without exposing plaintext or sensitive internal details; testing confirmed fail-closed rejection but identified internal exception detail in some error paths                             | Strict, uniform fail-closed handling with sanitized errors that do not expose plaintext or internal implementation details (protocol §7.4 / D018)                                                                                                                                         |
 
 ### Availability
@@ -203,7 +223,7 @@ If the pin itself is delivered by compromised frontend JavaScript, the attacker 
 
 Red-team testing also identified a pin-canonicalization weakness in which a non-canonical representation was accepted, indicating that identity comparisons should enforce a single canonical encoding.
 
-**Both directions are defended (protocol §4.1.1 / §4.3.1 / D015–D016).** Key substitution is not limited to the server key. Because the browser→server (c2s) prompt is sealed with the browser's *ephemeral* `enc`, it does not depend on the browser's static key — but the server→browser (s2c) *echo reply, which carries the prompt back*, is sealed to the browser's static `browser_x25519`, and the server holds no pin for the browser.
+**Both directions are defended (protocol §4.0.1 / §4.1.1 / §4.3.1 / D015–D016 / D027).** Key substitution is not limited to the server key. Because the browser→server (c2s) prompt is sealed with the browser's *ephemeral* `enc`, it does not depend on `browser_x25519` — but the server→browser (s2c) *echo reply, which carries the prompt back*, is sealed to the browser's per-connection `browser_x25519`, and the server holds no pin for the browser.
 
 An active proxy could rewrite the `hello` (keep the real `enc`, swap in its own `browser_x25519`, re-sign with its own Ed25519); the real pinned server would then validly sign a `server_hello` containing the attacker's key, so a signature-only check would pass and the reply would be sealed to the proxy.
 
@@ -261,7 +281,23 @@ The key-pinning handshake is useful for demonstrating key authenticity, but it i
 
 Production systems would need stronger decisions around provisioning, rotation, revocation, storage, and user/device identity.
 
-Because identity keys are static (D009), there is **no forward secrecy against long-term-key compromise** in either direction; adding per-epoch ephemeral recipient keys is future work.
+**Forward secrecy holds per connection (D026).** Both directions seal to ephemeral recipient keys that are wiped at teardown, so a wire recording is unrecoverable once the connection closes, whatever is stolen later. What is *not* covered: a key compromised while its session is live, and a long-lived connection that shares one pair of contexts (no mid-session rotation). Identity theft still allows impersonation from then on. Key erasure (below) covers the stored copy; together they make the claim complete: after the history window, neither the stored nor a captured copy of a prompt is recoverable.
+
+### Expiry Is a Server Promise
+
+History records become unrecoverable when the server erases the sealed epoch key at the end of `HISTORY_WINDOW` (protocol §9.5). The browser cannot verify that the erasure happened. A server that keeps the sealed keys keeps nothing it can read itself, but it keeps the ability of a future mnemonic holder to read old records.
+
+What erasure buys over row deletion is reach: the remote database and every backup of it hold only records that nothing in that location can decrypt.
+
+### Stored History Is Only as Secret as the Mnemonic
+
+Within the window, anyone holding the 24 words can open every live epoch key and therefore every live record. The identity key is static by design (D009). Shortening `HISTORY_WINDOW` bounds the exposure; nothing else does.
+
+An epoch private key also sits in browser memory for the length of a session. A compromised page (see Code Delivery) reads it as easily as it reads the prompt.
+
+### Storage Metadata Is Visible to the Server and the Database
+
+The owner's Ed25519 public key, epoch ids, record timestamps, record counts and sizes are stored in the clear on the server host and in Postgres. They reveal *who* talked, *when*, and *how much*, not *what*.
 
 ### Metadata Is Still Visible
 
@@ -297,7 +333,10 @@ The following are outside the protection provided by this demo:
 * Compromised frontend build pipeline
 * Compromised npm dependency
 * Tampered JavaScript bundle
-* Server private key theft
+* Identity key theft during a live session, and impersonation after any identity key theft
+* Mnemonic theft within the retention window
+* A server that does not erase expired epoch keys
+* Deleting individual records on demand, and pagination of long histories
 * Root or administrator access to the server
 * Production key management
 * Long-term key rotation and revocation

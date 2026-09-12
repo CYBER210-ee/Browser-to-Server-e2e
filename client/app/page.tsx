@@ -9,12 +9,21 @@
  *      public key (the PIN printed in the server console). Verify fetches
  *      /pubkey and runs the §4.1.1 pin gate; a green stoplight means the
  *      served key matched your pin AND its signature checked out.
- *   3) After a green light, the page runs hexToBytesthe full EchoVault handshake
- *      (hello / server_hello, §4.2–§4.3) over the WebSocket. Only then is the
- *      encrypted channel "established" and the Encrypt toggle usable.
+ *   3) After a green light, the page opens the WebSocket and waits for the
+ *      server's signed `server_key` — a fresh X25519 key minted for THIS
+ *      connection (§4.0, ADR 2). It checks it against the pin, mints its own
+ *      ephemeral, and only then runs hello / server_hello (§4.2–§4.3). Both
+ *      directions seal to keys that die with the connection: a recording of
+ *      the wire cannot be opened with anything that survives it.
  *   4) When Encrypt is ON, every message you send is sealed in the browser
  *      (HPKE, ChaCha20-Poly1305) and every echo is opened in the browser —
  *      a TLS-terminating proxy sees only { type, seq, ct }.
+ *   5) Stored history (ADR 212, protocol.md §9). Each prompt is ALSO sealed to
+ *      a random per-epoch key before it leaves the page and rides inside the
+ *      sealed msg; the epoch key itself is sealed to your identity key and
+ *      uploaded once. The server files blobs it cannot open and pushes them
+ *      back right after the handshake — same 24 words, same history, on any
+ *      browser. Expiry is the server erasing the epoch key after the window.
  *
  * Extra npm packages this page needs (on top of the original):
  *   npm i @scure/bip39 @noble/hashes @noble/curves \
@@ -47,13 +56,21 @@ const HKDF_SALT = hexToBytes(
 const INFO_X25519 = te.encode("echovault-x25519-encryption");
 const INFO_ED25519 = te.encode("echovault-ed25519-signing");
 const HPKE_INFO = te.encode("echovault/hpke/v1");
-const LABEL_PUBKEY = te.encode("echovault/pubkey/v1");
-const LABEL_HELLO = te.encode("echovault/hello/v1");
-const LABEL_SERVER_HELLO = te.encode("echovault/server_hello/v1");
+const LABEL_PUBKEY = te.encode("echovault/pubkey/v2");           // D028
+const LABEL_SERVER_KEY = te.encode("echovault/server_key/v1");   // D027
+const LABEL_HELLO = te.encode("echovault/hello/v2");             // D027
+const LABEL_SERVER_HELLO = te.encode("echovault/server_hello/v2");
 const AAD_STATE = te.encode("echovault");
 const DIR_C2S = te.encode("c2s"); // browser → server
 const DIR_S2C = te.encode("s2c"); // server → browser
 const TYPE_MSG = new Uint8Array([0x01]);
+const TYPE_EPOCH_KEY = new Uint8Array([0x04]);   // c2s only (§3.0.1, D023)
+const TYPE_HISTORY = new Uint8Array([0x05]);     // s2c only
+// Storage seals (§9): distinct info strings keep a stored blob from ever being
+// confused with a channel frame. Neither is derived from the mnemonic tree.
+const INFO_EPOCH_KEY = te.encode("echovault/epoch-key/v1");
+const INFO_RECORD = te.encode("echovault/record/v1");
+const EPOCH_ID_LEN = 16;
 
 // The HPKE cipher suite: X25519 key agreement + SHA-256 KDF + ChaCha20-Poly1305.
 const suite = new CipherSuite({
@@ -123,9 +140,55 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 // The 37-byte authentication label sealed into every message (protocol §3.1):
 // app name ‖ session fingerprint ‖ direction ‖ frame type ‖ counter.
-function buildAad(sessionId: Uint8Array, dir: Uint8Array, seq: number): Uint8Array {
-  return concatBytes(AAD_STATE, sessionId, dir, TYPE_MSG, seqToBytes8(seq));
+function buildAad(
+  sessionId: Uint8Array, dir: Uint8Array, seq: number, type: Uint8Array = TYPE_MSG,
+): Uint8Array {
+  return concatBytes(AAD_STATE, sessionId, dir, type, seqToBytes8(seq));
 }
+
+/* ----------------------------------------------------------------------------
+ * STORAGE SEALS — protocol.md §9. Every stored blob is an HPKE single-shot
+ * seal (one context, one message) so HPKE keeps owning the nonce (D014).
+ * -------------------------------------------------------------------------- */
+interface SealedBlob { enc: Uint8Array; ct: Uint8Array }
+
+// The storage AAD binds owner ‖ epoch (§9.4): a blob copied to another owner or
+// re-filed under another epoch fails open().
+function storageAad(ownerEd: Uint8Array, epochId: Uint8Array): Uint8Array {
+  return concatBytes(ownerEd, epochId);
+}
+
+async function sealTo(
+  recipientPub: Uint8Array, plaintext: Uint8Array, info: Uint8Array, aad: Uint8Array,
+): Promise<SealedBlob> {
+  const pk = await suite.kem.importKey("raw", ab(recipientPub), true);
+  const ctx = await suite.createSenderContext({ recipientPublicKey: pk, info: ab(info) });
+  const ct = new Uint8Array(await ctx.seal(ab(plaintext), ab(aad)));
+  return { enc: new Uint8Array(ctx.enc), ct };
+}
+
+async function openFrom(
+  recipientScalar: Uint8Array, blob: SealedBlob, info: Uint8Array, aad: Uint8Array,
+): Promise<Uint8Array> {
+  const sk = await suite.kem.importKey("raw", ab(recipientScalar), false);
+  const ctx = await suite.createRecipientContext({
+    recipientKey: sk, enc: ab(blob.enc), info: ab(info),
+  });
+  return new Uint8Array(await ctx.open(ab(blob.ct), ab(aad)));
+}
+
+// An epoch (§9.1): a RANDOM X25519 keypair + random id. Random on purpose —
+// anything derived from the mnemonic could be re-derived forever and so could
+// never expire. The scalar lives in memory for the session and, sealed to the
+// identity key, on the server host until the server erases it.
+interface Epoch {
+  id: Uint8Array;        // 16 bytes
+  scalar: Uint8Array;    // X25519 private key (opens records of this epoch)
+  pub: Uint8Array;       // X25519 public key (records are sealed TO this)
+  createdAt: number;     // UNIX seconds — server clock once uploaded
+}
+
+interface HistoryPolicy { epochLengthS: number; windowS: number }
 
 /* ----------------------------------------------------------------------------
  * IDENTITY — protocol.md §2: one mnemonic → two unrelated key pairs.
@@ -133,11 +196,15 @@ function buildAad(sessionId: Uint8Array, dir: Uint8Array, seq: number): Uint8Arr
  * localStorage under "mnemonic". Same words in = same keys out, every time.
  * -------------------------------------------------------------------------- */
 interface Identity {
-  xScalar: Uint8Array;  // X25519 private key (decrypts echoes sent to us)
-  xPub: Uint8Array;     // X25519 public key (the server seals echoes TO this)
+  xScalar: Uint8Array;  // X25519 private key — STORAGE identity: opens epoch keys (§9.2)
+  xPub: Uint8Array;     // X25519 public key — epoch keys are sealed TO this; never on the channel (D026)
   edSeed: Uint8Array;   // Ed25519 private key (signs our half of the handshake)
   edPub: Uint8Array;    // Ed25519 public key (server checks our signature with this)
 }
+
+// The per-connection recipient keypair (D026). Minted after `server_key`
+// verifies, used for the server→browser context, zeroed at teardown.
+interface Ephemeral { scalar: Uint8Array; pub: Uint8Array }
 
 async function deriveIdentity(mnemonic: string): Promise<Identity> {
   // Standard BIP-39 words → 64-byte seed, then HKDF splits it into the two
@@ -170,6 +237,8 @@ interface ChatMessage {
   timestamp: string;  // a human-readable time, e.g. "3:42:10 PM"
   encrypted: boolean; // wire framing: true → sealed {ct} block; false → {text}
                       // plaintext block, rendered in RED in the transcript
+  restored?: boolean; // came back in the history push (§5.4.2), not typed now;
+                      // echoes are rebuilt from the stored prompt (D025)
 }
 
 // Which wire mode the CURRENT WebSocket speaks:
@@ -241,12 +310,22 @@ export default function ChatApp() {
   const link = useRef<{
     identity: Identity | null;                                            // our keys
     pinnedEd: Uint8Array | null;                                          // trusted server signing key
-    pinnedX: Uint8Array | null;                                           // server encryption key (adopted via §4.1.1)
+    serverEph: Uint8Array | null;                                         // this connection's server recipient key (§4.0.1)
+    browserEph: Ephemeral | null;                                         // this connection's own recipient key (D026)
+    awaitingServerKey: boolean;                                           // AWAIT_SERVER_KEY phase (§5.6)
     sender: Awaited<ReturnType<CipherSuite["createSenderContext"]>> | null;   // seals c2s
     recipient: Awaited<ReturnType<CipherSuite["createRecipientContext"]>> | null; // opens s2c
     sessionId: Uint8Array | null;                                         // this handshake's fingerprint
+    tServerKey: Uint8Array | null;                                        // the server_key transcript we accepted
     tHello: Uint8Array | null;                                            // our signed hello bytes
-  }>({ identity: null, pinnedEd: null, pinnedX: null, sender: null, recipient: null, sessionId: null, tHello: null });
+    awaitingHistory: boolean;                                             // AWAIT_HISTORY phase (§5.6)
+    policy: HistoryPolicy | null;                                         // from the history push
+    epochs: Map<string, Epoch>;                                           // b64u(id) → epoch, live ones only
+  }>({
+    identity: null, pinnedEd: null, serverEph: null, browserEph: null, awaitingServerKey: false,
+    sender: null, recipient: null, sessionId: null, tServerKey: null, tHello: null,
+    awaitingHistory: false, policy: null, epochs: new Map(),
+  });
 
   /* ---------------------------- auto-scroll ----------------------------- */
   useEffect(() => {
@@ -290,7 +369,20 @@ export default function ChatApp() {
     link.current.sender = null;
     link.current.recipient = null;
     link.current.sessionId = null;
+    link.current.tServerKey = null;
     link.current.tHello = null;
+    // Per-connection recipient keys die with the connection (D026): zero ours,
+    // forget theirs. This is what makes a recording of the wire unrecoverable.
+    link.current.browserEph?.scalar.fill(0);
+    link.current.browserEph = null;
+    link.current.serverEph = null;
+    link.current.awaitingServerKey = false;
+    // Nothing about history is persisted in the browser (§9.6): zero the epoch
+    // scalars and forget them. The next handshake gets them back from the server.
+    for (const e of link.current.epochs.values()) e.scalar.fill(0);
+    link.current.epochs.clear();
+    link.current.policy = null;
+    link.current.awaitingHistory = false;
     c2sSeq.current = 0;
     lastS2C.current = -1;
     wireMode.current = 'none';
@@ -321,11 +413,10 @@ const wsBase =
   //      input; it exists only so we can compare it against the pin.
   //   3. Compare the served signing key to the pin, byte for byte. Mismatch
   //      → red light, stop. (A middleman swapping keys is caught right here.)
-  //   4. Check the signature over the served keys using the pinned key. This
-  //      proves the encryption key really belongs to the pinned identity.
-  //   5. Only then adopt the server's encryption key and light up GREEN.
-  // After the green light we immediately run the handshake to establish the
-  // encrypted channel (see establishChannel below).
+  //   4. Check the signature over the served key using the pinned key.
+  //   5. Only then light up GREEN. There is no encryption key here any more
+  //      (D028): the server's recipient key arrives per connection, signed, as
+  //      the first WebSocket frame (see establishChannel below).
   const handleVerify = async () => {
     try {
       setStatusNote('');
@@ -346,19 +437,17 @@ const wsBase =
       const res = await fetch(`${httpBase}/pubkey`);
       const pk = await res.json();
       const wireEd = unb64u(pk.server_ed25519, 32);
-      const wireX = unb64u(pk.server_x25519, 32);
       const sig = unb64u(pk.sig, 64);
 
       // Step 3 — pin comparison FIRST. The wire never teaches us a new key.
       if (!bytesEqual(wireEd, pinnedEd)) throw new Error('pin mismatch');
 
-      // Step 4 — signature over label ‖ encryption key ‖ signing key.
-      const tPubkey = concatBytes(LABEL_PUBKEY, wireX, wireEd);
+      // Step 4 — signature over label ‖ signing key (§4.1, v2).
+      const tPubkey = concatBytes(LABEL_PUBKEY, wireEd);
       if (!ed25519.verify(sig, tPubkey, pinnedEd)) throw new Error('bad sig');
 
-      // Step 5 — adopt the encryption key, bound to the pinned identity.
+      // Step 5 — the pin is confirmed live. Everything else arrives on the socket.
       link.current.pinnedEd = pinnedEd;
-      link.current.pinnedX = wireX;
       setPinStatus('valid');
       setStatusNote('Server key verified against pin — establishing encrypted channel…');
 
@@ -367,61 +456,46 @@ const wsBase =
       // One uniform failure path: red light, no channel, no detail an
       // attacker could learn from.
       link.current.pinnedEd = null;
-      link.current.pinnedX = null;
       setPinStatus('invalid');
       teardown('Server key verification failed — channel not established.');
     }
   };
 
-  /* --------------- THE HANDSHAKE: hello / server_hello ------------------ */
+  /* --------- THE HANDSHAKE: server_key / hello / server_hello ----------- */
   // Runs only after the green light. In plain English:
-  //   1. Create our outgoing encryption "pipe" aimed at the verified server
-  //      key; this mints a one-time key share ("enc") to send along.
-  //   2. Sign a transcript of everything that matters (our keys, our enc,
-  //      and the PINNED server keys) and send it as "hello".
+  //   0. Open the socket and WAIT. The server speaks first: a fresh X25519
+  //      key for this connection, signed by its identity ("server_key").
+  //      Check the signature with the PIN, never with a key off the wire.
+  //   1. Mint our own fresh X25519 key for this connection, then create our
+  //      outgoing encryption "pipe" aimed at the server's fresh key; this
+  //      mints a one-time key share ("enc") to send along.
+  //   2. Sign a transcript of everything that matters (our fresh key, our
+  //      identity, our enc, the server's fresh key, the PIN) and send it as
+  //      "hello".
   //   3. Wait for "server_hello". Rebuild the transcript the server should
-  //      have signed — from OUR OWN values and the PIN, never from the wire —
-  //      and check the signature with the pinned key. If a middleman swapped
-  //      anything (even just our own key on its way to the server!), this
-  //      check fails and we abort BEFORE any message is ever sealed (§4.3.1).
-  //   4. Derive the session fingerprint and open our incoming pipe. Done:
-  //      the Encrypt toggle comes alive.
+  //      have signed — from OUR OWN values, the key we accepted in step 0 and
+  //      the PIN, never from the wire — and check the signature with the
+  //      pinned key. If a middleman swapped anything (even just our own key
+  //      on its way to the server!), this check fails and we abort BEFORE any
+  //      message is ever sealed (§4.3.1).
+  //   4. Derive the session fingerprint and open our incoming pipe on our
+  //      fresh key. Then wait for the history push; then the Encrypt toggle
+  //      comes alive.
+  // Both fresh keys are zeroed at teardown, so nothing that survives the
+  // connection can open a recording of it (D026).
   const establishChannel = async () => {
-    const id = link.current.identity!;
-    const pinnedX = link.current.pinnedX!;
-    const pinnedEd = link.current.pinnedEd!;
-
     // Fresh counters for a fresh handshake (a new session restarts at 0).
     c2sSeq.current = 0;
     lastS2C.current = -1;
 
-    // Step 1 — outgoing pipe + one-time key share.
-    const serverPk = await suite.kem.importKey("raw", ab(pinnedX), true);
-    const sender = await suite.createSenderContext({
-      recipientPublicKey: serverPk,
-      info: ab(HPKE_INFO),
-    });
-    const enc = new Uint8Array(sender.enc);
-
-    // Step 2 — signed hello transcript (§4.2).
-    const tHello = concatBytes(LABEL_HELLO, id.xPub, id.edPub, enc, pinnedX, pinnedEd);
-    const helloSig = ed25519.sign(tHello, id.edSeed);
-
     const ws = new WebSocket(`${wsBase}/ws`);
     socketRef.current = ws;
     wireMode.current = 'secure';
-    link.current.sender = sender;
-    link.current.tHello = tHello;
+    link.current.awaitingServerKey = true;
 
     ws.onopen = () => {
       setIsConnected(true);
-      ws.send(JSON.stringify({
-        type: "hello",
-        browser_x25519: b64u(id.xPub),
-        browser_ed25519: b64u(id.edPub),
-        enc: b64u(enc),
-        sig: b64u(helloSig),
-      }));
+      setStatusNote('Connected — waiting for the server\u2019s connection key…');
     };
     ws.onerror = () => teardown('Connection error.');
     ws.onclose = (event) => {
@@ -534,6 +608,47 @@ const wsBase =
       return;
     }
 
+    // ---------- AWAIT_SERVER_KEY: the server's fresh key (§4.0.1) ----------
+    if (L.awaitingServerKey) {
+      if (data.type !== 'server_key') throw new Error('wrong frame for phase');
+      const id = L.identity!;
+      const pinnedEd = L.pinnedEd!;
+      const serverEph = unb64u(data.server_x25519, 32);
+      const sig = unb64u(data.sig, 64);
+
+      // Step 0 — the transcript is rebuilt from the PIN, so a proxy that
+      // re-signs a key of its own fails here, before we mint anything.
+      const tServerKey = concatBytes(LABEL_SERVER_KEY, serverEph, pinnedEd);
+      if (!ed25519.verify(sig, tServerKey, pinnedEd)) throw new Error('server_key rejected');
+      L.serverEph = serverEph;
+      L.tServerKey = tServerKey;
+      L.awaitingServerKey = false;
+
+      // Step 1 — our fresh key for this connection + outgoing pipe to theirs.
+      const scalar = x25519.utils.randomSecretKey();
+      L.browserEph = { scalar, pub: x25519.getPublicKey(scalar) };
+      const serverPk = await suite.kem.importKey("raw", ab(serverEph), true);
+      const sender = await suite.createSenderContext({
+        recipientPublicKey: serverPk,
+        info: ab(HPKE_INFO),
+      });
+      const enc = new Uint8Array(sender.enc);
+
+      // Step 2 — signed hello transcript (§4.2, v2).
+      const tHello = concatBytes(LABEL_HELLO, L.browserEph.pub, id.edPub, enc, serverEph, pinnedEd);
+      const helloSig = ed25519.sign(tHello, id.edSeed);
+      L.sender = sender;
+      L.tHello = tHello;
+      socketRef.current!.send(JSON.stringify({
+        type: "hello",
+        browser_x25519: b64u(L.browserEph.pub),
+        browser_ed25519: b64u(id.edPub),
+        enc: b64u(enc),
+        sig: b64u(helloSig),
+      }));
+      return;
+    }
+
     // -------- waiting for server_hello (strict state machine, §5.6) --------
     if (L.recipient === null) {
       if (data.type !== 'server_hello') throw new Error('wrong frame for phase');
@@ -541,22 +656,44 @@ const wsBase =
       const sig = unb64u(data.sig, 64);
 
       // Step 3 of the handshake (see establishChannel comment): rebuild the
-      // transcript from our own material + the pin, verify with the pin.
+      // transcript from our own fresh key, the server key we accepted, and
+      // the pin — then verify with the pin (§4.3.1).
       const tServerHello = concatBytes(
-        LABEL_SERVER_HELLO, encS2c, L.identity!.xPub, L.identity!.edPub,
-        L.pinnedX!, L.pinnedEd!,
+        LABEL_SERVER_HELLO, encS2c, L.browserEph!.pub, L.identity!.edPub,
+        L.serverEph!, L.pinnedEd!,
       );
       if (!ed25519.verify(sig, tServerHello, L.pinnedEd!))
         throw new Error('server_hello rejected');
 
-      // Step 4 — session fingerprint + incoming pipe. Channel is live.
-      L.sessionId = sha256(concatBytes(L.tHello!, tServerHello)).slice(0, 16);
-      const myPriv = await suite.kem.importKey("raw", ab(L.identity!.xScalar), false);
+      // Step 4 — session fingerprint over all three transcripts (§3.0) +
+      // incoming pipe on OUR FRESH KEY. Not live yet: the server's very next
+      // frame is the history push (§5.4.2), and we need our epoch keys from
+      // it before we can seal a prompt.
+      L.sessionId = sha256(concatBytes(L.tServerKey!, L.tHello!, tServerHello)).slice(0, 16);
+      const myPriv = await suite.kem.importKey("raw", ab(L.browserEph!.scalar), false);
       L.recipient = await suite.createRecipientContext({
         recipientKey: myPriv,
         enc: ab(encS2c),
         info: ab(HPKE_INFO),
       });
+      L.awaitingHistory = true;
+      setStatusNote('Handshake done — waiting for history…');
+      return;
+    }
+
+    // ------------------- AWAIT_HISTORY: the one-time push -------------------
+    // Strict: it must be a `history` frame at s2c seq 0, opened with TYPE 0x05.
+    // Anything else here is a fault (§5.6).
+    if (L.awaitingHistory) {
+      if (data.type !== 'history') throw new Error('wrong frame for phase');
+      if (data.seq !== '0000000000000000') throw new Error('seq gate');
+      const ct = unb64u(data.ct, -1);
+      if (ct.length < 16) throw new Error('bad ct');
+      const aad = buildAad(L.sessionId!, DIR_S2C, 0, TYPE_HISTORY);
+      const pt = await L.recipient.open(ab(ct), ab(aad));
+      lastS2C.current = 0;
+      await restoreHistory(JSON.parse(new TextDecoder().decode(pt)));
+      L.awaitingHistory = false;
       setEncChannel(true);
       setStatusNote('Encrypted channel established.');
       return;
@@ -603,6 +740,102 @@ const wsBase =
     throw new Error('PLAINTEXT_ON_SECURE');
   };
 
+  /* --------------------------- STORED HISTORY ---------------------------- */
+  // The history push (§5.4.2), in plain English:
+  //   1. Every live epoch key comes back sealed to OUR identity key — open it
+  //      with the X25519 scalar the mnemonic gave us (§9.2). Any browser with
+  //      the same 24 words can; the server never could.
+  //   2. Every record is sealed to one of those epoch keys — open it (§9.3).
+  //   3. Rebuild the transcript: the prompt, then the echo the server would
+  //      have sent (it is deterministic, D025), both marked "restored".
+  // A blob that fails to open is skipped, never rendered. The transcript is
+  // REPLACED, not appended to: what the server holds is the conversation.
+  const restoreHistory = async (h: {
+    policy: { epoch_length_s: number; window_s: number };
+    epochs: { epoch: string; created_at: number; enc: string; ct: string }[];
+    records: { epoch: string; created_at: number; enc: string; ct: string }[];
+  }) => {
+    const L = link.current;
+    const id = L.identity!;
+    if (typeof h?.policy?.epoch_length_s !== 'number' || typeof h?.policy?.window_s !== 'number')
+      throw new Error('bad history');
+    L.policy = { epochLengthS: h.policy.epoch_length_s, windowS: h.policy.window_s };
+
+    for (const e of h.epochs ?? []) {
+      const epochId = unb64u(e.epoch, EPOCH_ID_LEN);
+      const scalar = await openFrom(
+        id.xScalar, { enc: unb64u(e.enc, 32), ct: unb64u(e.ct, 48) },
+        INFO_EPOCH_KEY, storageAad(id.edPub, epochId),
+      );
+      L.epochs.set(e.epoch, {
+        id: epochId, scalar, pub: x25519.getPublicKey(scalar), createdAt: e.created_at,
+      });
+    }
+
+    const restored: ChatMessage[] = [];
+    for (const r of h.records ?? []) {
+      const epoch = L.epochs.get(r.epoch);
+      if (!epoch) continue;                       // its key was erased: unrecoverable by design
+      let text: string;
+      let ts: number;
+      try {
+        const pt = await openFrom(
+          epoch.scalar, { enc: unb64u(r.enc, 32), ct: unb64u(r.ct, -1) },
+          INFO_RECORD, storageAad(id.edPub, epoch.id),
+        );
+        const rec = JSON.parse(new TextDecoder().decode(pt));
+        if (typeof rec?.text !== 'string') continue;
+        text = rec.text;
+        ts = typeof rec.ts === 'number' ? rec.ts : r.created_at * 1000;
+      } catch {
+        continue;                                  // wrong owner/epoch or corrupt: not shown
+      }
+      const when = new Date(ts).toLocaleString();
+      restored.push({
+        id: nextMsgId.current++, seq: -1, text, type: 'msg', sender: 'user',
+        timestamp: when, encrypted: true, restored: true,
+      });
+      restored.push({
+        id: nextMsgId.current++, seq: -1, text: `ECHO: ${text}`, type: 'msg', sender: 'assistant',
+        timestamp: when, encrypted: true, restored: true,
+      });
+    }
+    setMessages(restored);
+  };
+
+  // The epoch to seal the next record to (§9.5): reuse the newest live epoch
+  // while it is younger than EPOCH_LENGTH, otherwise mint a fresh random one,
+  // seal its scalar to our identity key, and upload it in an `epoch_key` frame
+  // BEFORE the msg that will reference it. Both frames share the c2s counter.
+  const ensureEpoch = async (ws: WebSocket): Promise<Epoch> => {
+    const L = link.current;
+    const id = L.identity!;
+    const nowS = Math.floor(Date.now() / 1000);
+    let newest: Epoch | null = null;
+    for (const e of L.epochs.values())
+      if (!newest || e.createdAt > newest.createdAt) newest = e;
+    if (newest && nowS - newest.createdAt < L.policy!.epochLengthS) return newest;
+
+    const scalar = x25519.utils.randomSecretKey();
+    const epoch: Epoch = {
+      id: crypto.getRandomValues(new Uint8Array(EPOCH_ID_LEN)),
+      scalar, pub: x25519.getPublicKey(scalar), createdAt: nowS,
+    };
+    const sealed = await sealTo(id.xPub, scalar, INFO_EPOCH_KEY, storageAad(id.edPub, epoch.id));
+    const pt = te.encode(JSON.stringify({
+      epoch: b64u(epoch.id), enc: b64u(sealed.enc), ct: b64u(sealed.ct),
+    }));
+    const seq = c2sSeq.current;
+    const aad = buildAad(L.sessionId!, DIR_C2S, seq, TYPE_EPOCH_KEY);
+    const ct = new Uint8Array(await L.sender!.seal(ab(pt), ab(aad)));
+    ws.send(JSON.stringify({
+      type: 'epoch_key', seq: seq.toString(16).padStart(16, '0'), ct: b64u(ct),
+    }));
+    c2sSeq.current += 1;                           // one seal, one counter tick
+    L.epochs.set(b64u(epoch.id), epoch);
+    return epoch;
+  };
+
   /* ------------------------------ SENDING -------------------------------- */
   const handleSend = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -616,17 +849,16 @@ const wsBase =
       return;
     }
 
-    const currentSeq = c2sSeq.current;
     const sendingEncrypted =
       wireMode.current === 'secure' && encrypt && channelEstablished &&
-      !!link.current.sender && !!link.current.sessionId;
+      !!link.current.sender && !!link.current.sessionId && !!link.current.policy;
 
     // What we show in OUR OWN transcript (always the readable words — it's our
     // message; encryption only changes what goes over the wire). The
     // 'encrypted' flag drives the RED plaintext highlight.
     const localEcho: ChatMessage = {
       id: nextMsgId.current++,
-      seq: currentSeq,
+      seq: c2sSeq.current,
       text,
       type: 'msg',
       sender: 'user',
@@ -636,13 +868,26 @@ const wsBase =
 
     try {
       if (sendingEncrypted) {
-        // ENCRYPTED path: build the authentication label for "browser→server,
-        // message, counter N", seal the text, and put ONLY {type, seq, ct} on
-        // the wire. A proxy that terminates TLS sees ciphertext, not words.
-        const aad = buildAad(link.current.sessionId!, DIR_C2S, currentSeq);
-        const ct = new Uint8Array(
-          await link.current.sender!.seal(ab(te.encode(text)), ab(aad)),
+        // ENCRYPTED path. First make sure an epoch key is live (this may send
+        // an `epoch_key` frame and tick the counter). Then seal the prompt to
+        // the epoch key for storage (§9.3), wrap words + record into the §7.5
+        // plaintext, build the authentication label for "browser→server, msg,
+        // counter N", seal, and put ONLY {type, seq, ct} on the wire. A proxy
+        // that terminates TLS sees ciphertext, not words — and so does the
+        // server for the stored copy.
+        const epoch = await ensureEpoch(ws);
+        const id = link.current.identity!;
+        const rec = await sealTo(
+          epoch.pub, te.encode(JSON.stringify({ text, ts: Date.now() })),
+          INFO_RECORD, storageAad(id.edPub, epoch.id),
         );
+        const plaintext = te.encode(JSON.stringify({
+          text, rec: { epoch: b64u(epoch.id), enc: b64u(rec.enc), ct: b64u(rec.ct) },
+        }));
+        const currentSeq = c2sSeq.current;
+        localEcho.seq = currentSeq;
+        const aad = buildAad(link.current.sessionId!, DIR_C2S, currentSeq, TYPE_MSG);
+        const ct = new Uint8Array(await link.current.sender!.seal(ab(plaintext), ab(aad)));
         ws.send(JSON.stringify({
           type: 'msg',
           seq: currentSeq.toString(16).padStart(16, '0'),
@@ -654,7 +899,7 @@ const wsBase =
         // the secure channel carries 'ct'. Registering the transmit in
         // plainPending is what LICENSES the matching echo: without it the
         // incoming plaintext echo would be dropped by handleFrame.
-        ws.send(JSON.stringify({ type: 'msg', seq: currentSeq, text }));
+        ws.send(JSON.stringify({ type: 'msg', seq: c2sSeq.current, text }));
         plainPending.current += 1;
       } else {
         // Mode mismatch (e.g. Encrypt is ON but the channel is not
@@ -853,6 +1098,9 @@ const wsBase =
               <div className={`cg-bubble${msg.encrypted ? '' : ' plain'}`}>
                 {!msg.encrypted && (
                   <div className="cg-plain-badge">⚠ plaintext — not encrypted</div>
+                )}
+                {msg.restored && (
+                  <div className="cg-restored-badge">restored from history</div>
                 )}
                 <div className={`cg-text${msg.encrypted ? '' : ' plain'}`}>{msg.text}</div>
                 <div className="cg-time">{msg.timestamp}</div>

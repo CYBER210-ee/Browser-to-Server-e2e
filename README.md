@@ -56,9 +56,9 @@ This project includes:
 This project does not attempt to build a production LLM gateway or connect to a real LLM provider; the echo server is used to keep the demo simple and focused on network security. 
 
 **Stretch goals (only if Week 4 checkpoint is green):**
-- **Headline — Forward-secrecy epoch ratchet:** rotate the recipient key material on a
-  schedule so a stolen static key can't decrypt recorded traffic (restores the forward secrecy that a
-  static BIP-39 recipient key trades away).
+- **Headline — Forward secrecy:** ✅ delivered as per-connection ephemeral recipient keys
+  (ADR 2, D026–D028): a stolen static key can't decrypt recorded traffic. Mid-session rotation
+  remains open.
 - Multi-recipient HPKE seal (`{server, second-recipient}`, the VG `{supervisor, tenant}` shape);
   post-quantum hybrid X25519+ML-KEM-768; vendoring `hpke-js` for an offline demo; WebAuthn-gated
   mnemonic unlock; an untrusted-relay demo.
@@ -119,27 +119,84 @@ Deliverables per week (6 Weeks) 25 JUL (giving us \~2 week fluff):
 | Paper | | | || | draft | XXX | ★FINAL |
 
 
-### Project Basic Setup
+### Project layout
 ```
 cyber210-Browser-to-Server-e2e/
-├── client
-├── docs
-├── evidence
-├── scripts
-└── server
+├── client/             Next.js chat UI (browser-side HPKE + stored-history seals)
+├── server/             FastAPI echo server (HPKE open/seal, history push, expiry sweeper)
+├── echovault-deploy/   Docker: echo_client · echo_server · echo_db (+ legacy mitmproxy stack, see GUIDEv2.md)
+├── docs/               protocol.md (wire contract) · decisions.md (D001–D025) · threat-model.md · adr/
+└── evidence/           red-team captures
 ```
-#### Run the browser client 
+
+### Build and run (no proxy)
+
+Three pieces: the **history database**, the **server**, the **client**. The database
+holds only blobs the browser sealed to keys it never sees, so it may run on the same
+machine or on a different one (ADR 212, `docs/decisions.md` D021–D025).
+
+#### 1. History database (Postgres, TLS only)
+```bash
+cd echovault-deploy/echo_db
+./gen-db-certs.sh                 # CA + server cert; SAN_HOSTS="db localhost <your-db-host>" if remote
+cp .env.example .env              # set POSTGRES_PASSWORD
+docker compose up -d              # listens on :5432, refuses non-TLS connections
 ```
-cd client
-npm install
-npm run dev          
-http://localhost:3000
-```
-#### Run the web server
-```
+Copy `certs/db-ca.crt` to wherever the server runs — it is what the server's
+`sslmode=verify-full` trusts. Keep the `.key` files on the database box.
+
+#### 2. Server
+```bash
 cd server
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
-pip install -r requirements.txt          # or: pip install "fastapi[standard]" "uvicorn[standard]"
+pip install -r requirements.txt
+cp .env.example .env
+python generate_keys.py           # paste the SERVER_ED25519_PRIVATE_KEY_HEX line into .env
+```
+Edit `.env`: `DATABASE_URL` must match the database's user/password/host and stay
+`sslmode=verify-full`; `DB_SSLROOTCERT` points at `db-ca.crt`; `EPOCH_LENGTH` and
+`HISTORY_WINDOW` set how long history lives (protocol §9.5). Then:
+```bash
 uvicorn main:app --reload --port 8000
+# console prints:  [echovault] server pin (Ed25519, base64url): …   ← the browser pin
 http://localhost:8000/api/health
 ```
+> No database yet? `HISTORY_BACKEND=memory` runs the server with records in RAM
+> (nothing survives a restart). Epoch keys still land in `EPOCH_DB_PATH`.
+
+Tests: `pytest` from `server/` (30 tests; the Postgres round-trip runs only when
+`DATABASE_URL` is set).
+
+#### 3. Client
+```bash
+cd client
+npm ci
+npm run dev                       # http://localhost:3000  (talks to http://localhost:8000)
+```
+Open **Key Vault**, create or paste a 24-word mnemonic, go back, paste the server pin
+from the server console into the *Server key* box, press **Verify**. The handshake
+runs, the server pushes your history, and the transcript shows what it holds —
+same words on any browser, same history. `npm run lint` and `npm run build` are the
+client checks.
+
+#### Everything in Docker
+```bash
+cd echovault-deploy
+./echo_db/gen-db-certs.sh && cp echo_db/.env.example echo_db/.env            # edit password
+cp echo_server/.env.example echo_server/.env   # server keys (python generate_keys.py) + the same password
+docker compose up -d --build      # client :3000 · server :8000 · db :5432
+```
+The client image bakes `NEXT_PUBLIC_API_URL=http://localhost:8000`; change the build
+arg in `docker-compose.yml` if the browser reaches the server by another name. To run
+the database elsewhere, bring up `echo_db/docker-compose.yml` on that box, point
+`DATABASE_URL` at it, and make sure `gen-db-certs.sh` was run with that hostname in
+`SAN_HOSTS`.
+
+### How history works, in one paragraph
+Each prompt is sealed **in the page** to a random per-epoch key and rides inside the
+message the browser was already sending; the epoch key is sealed to the identity key
+the mnemonic derives and uploaded once. The server files blobs it cannot open (epoch
+keys on its own host, records in Postgres) and pushes them back right after the
+handshake. When an epoch is older than `HISTORY_WINDOW` the server **erases** the sealed
+epoch key, and every record of that epoch becomes unrecoverable everywhere, backups
+included. Details: `docs/protocol.md` §9, `docs/adr/212-epoch-expiry.md`.
