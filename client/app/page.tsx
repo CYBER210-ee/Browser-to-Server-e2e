@@ -9,9 +9,12 @@
  *      public key (the PIN printed in the server console). Verify fetches
  *      /pubkey and runs the §4.1.1 pin gate; a green stoplight means the
  *      served key matched your pin AND its signature checked out.
- *   3) After a green light, the page runs hexToBytesthe full EchoVault handshake
- *      (hello / server_hello, §4.2–§4.3) over the WebSocket. Only then is the
- *      encrypted channel "established" and the Encrypt toggle usable.
+ *   3) After a green light, the page opens the WebSocket and waits for the
+ *      server's signed `server_key` — a fresh X25519 key minted for THIS
+ *      connection (§4.0, ADR 2). It checks it against the pin, mints its own
+ *      ephemeral, and only then runs hello / server_hello (§4.2–§4.3). Both
+ *      directions seal to keys that die with the connection: a recording of
+ *      the wire cannot be opened with anything that survives it.
  *   4) When Encrypt is ON, every message you send is sealed in the browser
  *      (HPKE, ChaCha20-Poly1305) and every echo is opened in the browser —
  *      a TLS-terminating proxy sees only { type, seq, ct }.
@@ -53,9 +56,10 @@ const HKDF_SALT = hexToBytes(
 const INFO_X25519 = te.encode("echovault-x25519-encryption");
 const INFO_ED25519 = te.encode("echovault-ed25519-signing");
 const HPKE_INFO = te.encode("echovault/hpke/v1");
-const LABEL_PUBKEY = te.encode("echovault/pubkey/v1");
-const LABEL_HELLO = te.encode("echovault/hello/v1");
-const LABEL_SERVER_HELLO = te.encode("echovault/server_hello/v1");
+const LABEL_PUBKEY = te.encode("echovault/pubkey/v2");           // D028
+const LABEL_SERVER_KEY = te.encode("echovault/server_key/v1");   // D027
+const LABEL_HELLO = te.encode("echovault/hello/v2");             // D027
+const LABEL_SERVER_HELLO = te.encode("echovault/server_hello/v2");
 const AAD_STATE = te.encode("echovault");
 const DIR_C2S = te.encode("c2s"); // browser → server
 const DIR_S2C = te.encode("s2c"); // server → browser
@@ -192,11 +196,15 @@ interface HistoryPolicy { epochLengthS: number; windowS: number }
  * localStorage under "mnemonic". Same words in = same keys out, every time.
  * -------------------------------------------------------------------------- */
 interface Identity {
-  xScalar: Uint8Array;  // X25519 private key (decrypts echoes sent to us)
-  xPub: Uint8Array;     // X25519 public key (the server seals echoes TO this)
+  xScalar: Uint8Array;  // X25519 private key — STORAGE identity: opens epoch keys (§9.2)
+  xPub: Uint8Array;     // X25519 public key — epoch keys are sealed TO this; never on the channel (D026)
   edSeed: Uint8Array;   // Ed25519 private key (signs our half of the handshake)
   edPub: Uint8Array;    // Ed25519 public key (server checks our signature with this)
 }
+
+// The per-connection recipient keypair (D026). Minted after `server_key`
+// verifies, used for the server→browser context, zeroed at teardown.
+interface Ephemeral { scalar: Uint8Array; pub: Uint8Array }
 
 async function deriveIdentity(mnemonic: string): Promise<Identity> {
   // Standard BIP-39 words → 64-byte seed, then HKDF splits it into the two
@@ -302,17 +310,21 @@ export default function ChatApp() {
   const link = useRef<{
     identity: Identity | null;                                            // our keys
     pinnedEd: Uint8Array | null;                                          // trusted server signing key
-    pinnedX: Uint8Array | null;                                           // server encryption key (adopted via §4.1.1)
+    serverEph: Uint8Array | null;                                         // this connection's server recipient key (§4.0.1)
+    browserEph: Ephemeral | null;                                         // this connection's own recipient key (D026)
+    awaitingServerKey: boolean;                                           // AWAIT_SERVER_KEY phase (§5.6)
     sender: Awaited<ReturnType<CipherSuite["createSenderContext"]>> | null;   // seals c2s
     recipient: Awaited<ReturnType<CipherSuite["createRecipientContext"]>> | null; // opens s2c
     sessionId: Uint8Array | null;                                         // this handshake's fingerprint
+    tServerKey: Uint8Array | null;                                        // the server_key transcript we accepted
     tHello: Uint8Array | null;                                            // our signed hello bytes
     awaitingHistory: boolean;                                             // AWAIT_HISTORY phase (§5.6)
     policy: HistoryPolicy | null;                                         // from the history push
     epochs: Map<string, Epoch>;                                           // b64u(id) → epoch, live ones only
   }>({
-    identity: null, pinnedEd: null, pinnedX: null, sender: null, recipient: null,
-    sessionId: null, tHello: null, awaitingHistory: false, policy: null, epochs: new Map(),
+    identity: null, pinnedEd: null, serverEph: null, browserEph: null, awaitingServerKey: false,
+    sender: null, recipient: null, sessionId: null, tServerKey: null, tHello: null,
+    awaitingHistory: false, policy: null, epochs: new Map(),
   });
 
   /* ---------------------------- auto-scroll ----------------------------- */
@@ -357,7 +369,14 @@ export default function ChatApp() {
     link.current.sender = null;
     link.current.recipient = null;
     link.current.sessionId = null;
+    link.current.tServerKey = null;
     link.current.tHello = null;
+    // Per-connection recipient keys die with the connection (D026): zero ours,
+    // forget theirs. This is what makes a recording of the wire unrecoverable.
+    link.current.browserEph?.scalar.fill(0);
+    link.current.browserEph = null;
+    link.current.serverEph = null;
+    link.current.awaitingServerKey = false;
     // Nothing about history is persisted in the browser (§9.6): zero the epoch
     // scalars and forget them. The next handshake gets them back from the server.
     for (const e of link.current.epochs.values()) e.scalar.fill(0);
@@ -394,11 +413,10 @@ const wsBase =
   //      input; it exists only so we can compare it against the pin.
   //   3. Compare the served signing key to the pin, byte for byte. Mismatch
   //      → red light, stop. (A middleman swapping keys is caught right here.)
-  //   4. Check the signature over the served keys using the pinned key. This
-  //      proves the encryption key really belongs to the pinned identity.
-  //   5. Only then adopt the server's encryption key and light up GREEN.
-  // After the green light we immediately run the handshake to establish the
-  // encrypted channel (see establishChannel below).
+  //   4. Check the signature over the served key using the pinned key.
+  //   5. Only then light up GREEN. There is no encryption key here any more
+  //      (D028): the server's recipient key arrives per connection, signed, as
+  //      the first WebSocket frame (see establishChannel below).
   const handleVerify = async () => {
     try {
       setStatusNote('');
@@ -419,19 +437,17 @@ const wsBase =
       const res = await fetch(`${httpBase}/pubkey`);
       const pk = await res.json();
       const wireEd = unb64u(pk.server_ed25519, 32);
-      const wireX = unb64u(pk.server_x25519, 32);
       const sig = unb64u(pk.sig, 64);
 
       // Step 3 — pin comparison FIRST. The wire never teaches us a new key.
       if (!bytesEqual(wireEd, pinnedEd)) throw new Error('pin mismatch');
 
-      // Step 4 — signature over label ‖ encryption key ‖ signing key.
-      const tPubkey = concatBytes(LABEL_PUBKEY, wireX, wireEd);
+      // Step 4 — signature over label ‖ signing key (§4.1, v2).
+      const tPubkey = concatBytes(LABEL_PUBKEY, wireEd);
       if (!ed25519.verify(sig, tPubkey, pinnedEd)) throw new Error('bad sig');
 
-      // Step 5 — adopt the encryption key, bound to the pinned identity.
+      // Step 5 — the pin is confirmed live. Everything else arrives on the socket.
       link.current.pinnedEd = pinnedEd;
-      link.current.pinnedX = wireX;
       setPinStatus('valid');
       setStatusNote('Server key verified against pin — establishing encrypted channel…');
 
@@ -440,61 +456,46 @@ const wsBase =
       // One uniform failure path: red light, no channel, no detail an
       // attacker could learn from.
       link.current.pinnedEd = null;
-      link.current.pinnedX = null;
       setPinStatus('invalid');
       teardown('Server key verification failed — channel not established.');
     }
   };
 
-  /* --------------- THE HANDSHAKE: hello / server_hello ------------------ */
+  /* --------- THE HANDSHAKE: server_key / hello / server_hello ----------- */
   // Runs only after the green light. In plain English:
-  //   1. Create our outgoing encryption "pipe" aimed at the verified server
-  //      key; this mints a one-time key share ("enc") to send along.
-  //   2. Sign a transcript of everything that matters (our keys, our enc,
-  //      and the PINNED server keys) and send it as "hello".
+  //   0. Open the socket and WAIT. The server speaks first: a fresh X25519
+  //      key for this connection, signed by its identity ("server_key").
+  //      Check the signature with the PIN, never with a key off the wire.
+  //   1. Mint our own fresh X25519 key for this connection, then create our
+  //      outgoing encryption "pipe" aimed at the server's fresh key; this
+  //      mints a one-time key share ("enc") to send along.
+  //   2. Sign a transcript of everything that matters (our fresh key, our
+  //      identity, our enc, the server's fresh key, the PIN) and send it as
+  //      "hello".
   //   3. Wait for "server_hello". Rebuild the transcript the server should
-  //      have signed — from OUR OWN values and the PIN, never from the wire —
-  //      and check the signature with the pinned key. If a middleman swapped
-  //      anything (even just our own key on its way to the server!), this
-  //      check fails and we abort BEFORE any message is ever sealed (§4.3.1).
-  //   4. Derive the session fingerprint and open our incoming pipe. Done:
-  //      the Encrypt toggle comes alive.
+  //      have signed — from OUR OWN values, the key we accepted in step 0 and
+  //      the PIN, never from the wire — and check the signature with the
+  //      pinned key. If a middleman swapped anything (even just our own key
+  //      on its way to the server!), this check fails and we abort BEFORE any
+  //      message is ever sealed (§4.3.1).
+  //   4. Derive the session fingerprint and open our incoming pipe on our
+  //      fresh key. Then wait for the history push; then the Encrypt toggle
+  //      comes alive.
+  // Both fresh keys are zeroed at teardown, so nothing that survives the
+  // connection can open a recording of it (D026).
   const establishChannel = async () => {
-    const id = link.current.identity!;
-    const pinnedX = link.current.pinnedX!;
-    const pinnedEd = link.current.pinnedEd!;
-
     // Fresh counters for a fresh handshake (a new session restarts at 0).
     c2sSeq.current = 0;
     lastS2C.current = -1;
 
-    // Step 1 — outgoing pipe + one-time key share.
-    const serverPk = await suite.kem.importKey("raw", ab(pinnedX), true);
-    const sender = await suite.createSenderContext({
-      recipientPublicKey: serverPk,
-      info: ab(HPKE_INFO),
-    });
-    const enc = new Uint8Array(sender.enc);
-
-    // Step 2 — signed hello transcript (§4.2).
-    const tHello = concatBytes(LABEL_HELLO, id.xPub, id.edPub, enc, pinnedX, pinnedEd);
-    const helloSig = ed25519.sign(tHello, id.edSeed);
-
     const ws = new WebSocket(`${wsBase}/ws`);
     socketRef.current = ws;
     wireMode.current = 'secure';
-    link.current.sender = sender;
-    link.current.tHello = tHello;
+    link.current.awaitingServerKey = true;
 
     ws.onopen = () => {
       setIsConnected(true);
-      ws.send(JSON.stringify({
-        type: "hello",
-        browser_x25519: b64u(id.xPub),
-        browser_ed25519: b64u(id.edPub),
-        enc: b64u(enc),
-        sig: b64u(helloSig),
-      }));
+      setStatusNote('Connected — waiting for the server\u2019s connection key…');
     };
     ws.onerror = () => teardown('Connection error.');
     ws.onclose = (event) => {
@@ -607,6 +608,47 @@ const wsBase =
       return;
     }
 
+    // ---------- AWAIT_SERVER_KEY: the server's fresh key (§4.0.1) ----------
+    if (L.awaitingServerKey) {
+      if (data.type !== 'server_key') throw new Error('wrong frame for phase');
+      const id = L.identity!;
+      const pinnedEd = L.pinnedEd!;
+      const serverEph = unb64u(data.server_x25519, 32);
+      const sig = unb64u(data.sig, 64);
+
+      // Step 0 — the transcript is rebuilt from the PIN, so a proxy that
+      // re-signs a key of its own fails here, before we mint anything.
+      const tServerKey = concatBytes(LABEL_SERVER_KEY, serverEph, pinnedEd);
+      if (!ed25519.verify(sig, tServerKey, pinnedEd)) throw new Error('server_key rejected');
+      L.serverEph = serverEph;
+      L.tServerKey = tServerKey;
+      L.awaitingServerKey = false;
+
+      // Step 1 — our fresh key for this connection + outgoing pipe to theirs.
+      const scalar = x25519.utils.randomSecretKey();
+      L.browserEph = { scalar, pub: x25519.getPublicKey(scalar) };
+      const serverPk = await suite.kem.importKey("raw", ab(serverEph), true);
+      const sender = await suite.createSenderContext({
+        recipientPublicKey: serverPk,
+        info: ab(HPKE_INFO),
+      });
+      const enc = new Uint8Array(sender.enc);
+
+      // Step 2 — signed hello transcript (§4.2, v2).
+      const tHello = concatBytes(LABEL_HELLO, L.browserEph.pub, id.edPub, enc, serverEph, pinnedEd);
+      const helloSig = ed25519.sign(tHello, id.edSeed);
+      L.sender = sender;
+      L.tHello = tHello;
+      socketRef.current!.send(JSON.stringify({
+        type: "hello",
+        browser_x25519: b64u(L.browserEph.pub),
+        browser_ed25519: b64u(id.edPub),
+        enc: b64u(enc),
+        sig: b64u(helloSig),
+      }));
+      return;
+    }
+
     // -------- waiting for server_hello (strict state machine, §5.6) --------
     if (L.recipient === null) {
       if (data.type !== 'server_hello') throw new Error('wrong frame for phase');
@@ -614,19 +656,21 @@ const wsBase =
       const sig = unb64u(data.sig, 64);
 
       // Step 3 of the handshake (see establishChannel comment): rebuild the
-      // transcript from our own material + the pin, verify with the pin.
+      // transcript from our own fresh key, the server key we accepted, and
+      // the pin — then verify with the pin (§4.3.1).
       const tServerHello = concatBytes(
-        LABEL_SERVER_HELLO, encS2c, L.identity!.xPub, L.identity!.edPub,
-        L.pinnedX!, L.pinnedEd!,
+        LABEL_SERVER_HELLO, encS2c, L.browserEph!.pub, L.identity!.edPub,
+        L.serverEph!, L.pinnedEd!,
       );
       if (!ed25519.verify(sig, tServerHello, L.pinnedEd!))
         throw new Error('server_hello rejected');
 
-      // Step 4 — session fingerprint + incoming pipe. Not live yet: the
-      // server's very next frame is the history push (§5.4.2), and we need
-      // our epoch keys from it before we can seal a prompt.
-      L.sessionId = sha256(concatBytes(L.tHello!, tServerHello)).slice(0, 16);
-      const myPriv = await suite.kem.importKey("raw", ab(L.identity!.xScalar), false);
+      // Step 4 — session fingerprint over all three transcripts (§3.0) +
+      // incoming pipe on OUR FRESH KEY. Not live yet: the server's very next
+      // frame is the history push (§5.4.2), and we need our epoch keys from
+      // it before we can seal a prompt.
+      L.sessionId = sha256(concatBytes(L.tServerKey!, L.tHello!, tServerHello)).slice(0, 16);
+      const myPriv = await suite.kem.importKey("raw", ab(L.browserEph!.scalar), false);
       L.recipient = await suite.createRecipientContext({
         recipientKey: myPriv,
         enc: ab(encS2c),

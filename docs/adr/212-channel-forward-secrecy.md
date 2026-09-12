@@ -1,6 +1,6 @@
 # ADR 2 — Per-connection channel forward secrecy
 
-Branch: `212/channel_fs` (on top of `212/epoch_expiry`) · Status: in progress · Previous: ADR 212 epoch expiry · Next: ADR 3 retire `echovault-deploy/`
+Branch: `212/channel_fs` (on top of `212/epoch_expiry`) · Status: implemented on branch 212/channel_fs (stacked on 212/epoch_expiry), awaiting push + manual review · Previous: ADR 212 epoch expiry · Next: ADR 3 retire `echovault-deploy/`
 
 ## Goal
 
@@ -59,11 +59,11 @@ the proxy · the deploy directory (ADR 3).
 - [x] Mirror into `echovault-deploy/echo_server/`
 
 ### 3. Client (`client/app/page.tsx`)
-- [ ] Verify: `/pubkey` v2 (Ed25519 pin only)
-- [ ] `AWAIT_SERVER_KEY` phase: verify `server_key` with the pin, mint the browser
+- [x] Verify: `/pubkey` v2 (Ed25519 pin only)
+- [x] `AWAIT_SERVER_KEY` phase: verify `server_key` with the pin, mint the browser
       ephemeral, then send `hello`
-- [ ] `server_hello` gate against own ephemeral + accepted server ephemeral
-- [ ] Ephemeral scalar zeroed on teardown; static X25519 used only for storage seals
+- [x] `server_hello` gate against own ephemeral + accepted server ephemeral
+- [x] Ephemeral scalar zeroed on teardown; static X25519 used only for storage seals
 
 ### 4. Tests
 - [x] `PyBrowser` speaks the new handshake; existing history tests still pass
@@ -71,7 +71,7 @@ the proxy · the deploy directory (ADR 3).
       ephemeral · `server_hello` with a swapped browser ephemeral
 - [x] Two connections → different `enc`s and `SESSION_ID`s
 - [x] Forward secrecy: a captured c2s `ct` does not open with the server's static key
-- [ ] `npm run lint` / `npm run build`
+- [x] `npm run lint` / `npm run build`
 
 ### 5. Delivery
 - [ ] Local commits ready; user pushes and opens the PR
