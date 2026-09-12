@@ -1,6 +1,6 @@
 # ADR 212 — Mnemonic-owned chat history with epoch expiry
 
-Branch: `212/epoch_expiry` · Status: in progress · Next ADR: per-connection channel forward secrecy
+Branch: `212/epoch_expiry` · Status: implemented, initial PR pending review · Next ADR: per-connection channel forward secrecy
 
 ## Goal
 
@@ -77,11 +77,11 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
 - [x] Wipe epoch keys and history state on teardown
 
 ### 5. Database container and deploy
-- [ ] `echovault-deploy/echo_db/`: Postgres compose, TLS-only config + scram, cert generation
+- [x] `echovault-deploy/echo_db/`: Postgres compose, TLS-only config + scram, cert generation
       script, `init.sql`
-- [ ] Server Dockerfile/compose carry the DB CA cert and new `.env` values; SQLite volume
-- [ ] Three-service compose (client, server, db), no proxy
-- [ ] README setup section replaced with build/run instructions (local dev + compose)
+- [x] Server Dockerfile/compose carry the DB CA cert and new `.env` values; SQLite volume
+- [x] Three-service compose (client, server, db), no proxy
+- [x] README setup section replaced with build/run instructions (local dev + compose)
 
 ### 6. Tests and checks
 - [x] pytest: epoch key store + sweeper expiry; record store (Postgres only when

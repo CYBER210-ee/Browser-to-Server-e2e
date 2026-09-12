@@ -1,0 +1,41 @@
+# ── EchoVault history database (ADR 212 / D024) ──────────────────────────────
+# Holds ONLY sealed prompt records: blobs the browser sealed to per-epoch keys
+# that this box never sees. It can run anywhere — same host as the server or a
+# different one — because nothing here can decrypt what it stores. The link is
+# TLS-only (pg_hba.conf) and the server verifies this cert chain (verify-full).
+#
+#   ./gen-db-certs.sh            # once: CA + server cert (SAN = hostnames below)
+#   cp .env.example .env          # set POSTGRES_PASSWORD
+#   docker compose up -d
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: echo_db
+    restart: unless-stopped
+    env_file:
+      - .env                       # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+    ports:
+      - "5432:5432"                # published so a REMOTE server can reach it
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./certs:/certs:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # Postgres insists the key be owned by its user with mode 0600, which a
+    # read-only bind mount can't guarantee — copy the pair into place first.
+    command: >
+      sh -c "install -o postgres -g postgres -m 600 /certs/db.key /var/lib/postgresql/db.key &&
+             install -o postgres -g postgres -m 644 /certs/db.crt /var/lib/postgresql/db.crt &&
+             exec docker-entrypoint.sh postgres
+               -c ssl=on
+               -c ssl_cert_file=/var/lib/postgresql/db.crt
+               -c ssl_key_file=/var/lib/postgresql/db.key
+               -c hba_file=/etc/postgresql/pg_hba.conf"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-echovault} -d $${POSTGRES_DB:-echovault}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

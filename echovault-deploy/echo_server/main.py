@@ -36,6 +36,8 @@ async def lifespan(app: FastAPI):
     # the sweeper erases expired epoch keys on a timer as well as per connection.
     global HISTORY
     HISTORY = open_history_service()
+    # The out-of-band pin (§4.1.1): read it off this console, never off the wire.
+    print(f"[echovault] server pin (Ed25519, base64url): {b64url_encode(SERVER_KEYS.ed25519_pub_bytes)}")
     sweeper = asyncio.create_task(HISTORY.run_sweeper())
     try:
         yield
