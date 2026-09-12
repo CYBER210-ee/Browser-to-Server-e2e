@@ -1,6 +1,6 @@
 # ADR 3 — Close CYBER210, open CYBER212
 
-Branch: `212/cleanup` (on top of `212/channel_fs`) · Status: in progress · Previous: ADR 2 channel forward secrecy · Next: ADR 4 cloud deployment
+Branch: `212/cleanup` (on top of `212/channel_fs`) · Status: implemented on branch 212/cleanup (stacked on 212/channel_fs), awaiting push + manual review · Previous: ADR 2 channel forward secrecy · Next: ADR 4 cloud deployment
 
 ## Goal
 
@@ -42,38 +42,38 @@ any change to tag `EchoSrv`.
 ## Checklist
 
 ### 1. Docs
-- [ ] D029–D031 in `docs/decisions.md`; course-boundary note (D001–D020 = CYBER210 baseline)
-- [ ] `docs/protocol.md`: drop every E2E-OFF / `/ws/plain` / `text`-frame reference; §9.5–§9.6
+- [x] D029–D031 in `docs/decisions.md`; course-boundary note (D001–D020 = CYBER210 baseline)
+- [x] `docs/protocol.md`: drop every E2E-OFF / `/ws/plain` / `text`-frame reference; §9.5–§9.6
       note `server_name`; endpoints list
-- [ ] `docs/threat-model.md`: drop the exhibit framing and the mitmproxy actor; single-column
+- [x] `docs/threat-model.md`: drop the exhibit framing and the mitmproxy actor; single-column
       tables; add the CYBER212 direction (proxy + WAF, RDS, N servers, per-server history)
-- [ ] `docs/cyber212/README.md`: target architecture, the foundation table, migration notes
+- [x] `docs/cyber212/README.md`: target architecture, the foundation table, migration notes
 
 ### 2. Layout
-- [ ] Move course artifacts to `docs/cyber210/` (paper, deck, diagrams, how-tos, evidence,
+- [x] Move course artifacts to `docs/cyber210/` (paper, deck, diagrams, how-tos, evidence,
       GUIDEv2); add a short index there
-- [ ] Dockerfiles → `client/Dockerfile`, `server/Dockerfile`; `echovault-deploy/echo_db/` → `db/`
-- [ ] Root `docker-compose.yml` (client · server · db); delete `echovault-deploy/`
-- [ ] `.gitignore` paths updated
+- [x] Dockerfiles → `client/Dockerfile`, `server/Dockerfile`; `echovault-deploy/echo_db/` → `db/`
+- [x] Root `docker-compose.yml` (client · server · db); delete `echovault-deploy/`
+- [x] `.gitignore` paths updated
 
 ### 3. Server
-- [ ] Remove `/ws/plain`
-- [ ] `server/certs/gen-server-certs.sh` (CA + per-server leaf, SAN from `SERVER_NAME`)
-- [ ] uvicorn TLS on 8443 (compose command + README run line); `SERVER_NAME` in `/api/status`
-- [ ] `server_name` on records: schema, insert, filter (Postgres + memory), `init.sql`
-- [ ] Tests updated; new test: records filed under another server are not returned
+- [x] Remove `/ws/plain`
+- [x] `server/certs/gen-server-certs.sh` (CA + per-server leaf, SAN from `SERVER_NAME`)
+- [x] uvicorn TLS on 8443 (compose command + README run line); `SERVER_NAME` in `/api/status`
+- [x] `server_name` on records: schema, insert, filter (Postgres + memory), `init.sql`
+- [x] Tests updated; new test: records filed under another server are not returned
 
 ### 4. Client
-- [ ] Remove plaintext mode (toggle, wire mode, pending gate, red rendering + CSS)
-- [ ] `NEXT_PUBLIC_API_URL` default `https://localhost:8443`; header comment
+- [x] Remove plaintext mode (toggle, wire mode, pending gate, red rendering + CSS)
+- [x] `NEXT_PUBLIC_API_URL` default `https://localhost:8443`; header comment
 
 ### 5. README
-- [ ] Rewrite: what EchoVault is · history (CYBER210 at `EchoSrv`, CYBER212 on main) ·
+- [x] Rewrite: what EchoVault is · history (CYBER210 at `EchoSrv`, CYBER212 on main) ·
       architecture · build/run incl. trusting the server CA
 
 ### 6. Checks
-- [ ] pytest green · `npm run lint` / `npm run build`
-- [ ] `grep -ri "mitmproxy\|ws/plain" --exclude-dir=docs/cyber210 --exclude-dir=node_modules`
+- [x] pytest green · `npm run lint` / `npm run build`
+- [x] `grep -ri "mitmproxy\|ws/plain" --exclude-dir=docs/cyber210 --exclude-dir=node_modules`
       returns only historical mentions in decisions.md
 
 ### 7. Delivery
