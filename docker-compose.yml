@@ -25,10 +25,10 @@ services:
       - ./db/certs/db-ca.crt:/app/certs/db-ca.crt:ro   # what verify-full trusts
       - ./server/certs:/app/certs/tls:ro                 # this server's TLS leaf + the server CA (D030)
       - epochkeys:/data                                  # sealed epoch keys stay on THIS host (D024/D031)
-    command: >
-      sh -c "exec uvicorn main:app --host 0.0.0.0 --port 8443
-             --ssl-keyfile /app/certs/tls/$${SERVER_NAME:-echovault}.key
-             --ssl-certfile /app/certs/tls/$${SERVER_NAME:-echovault}.crt"
+    command:
+      - sh
+      - -c
+      - exec uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile /app/certs/tls/$${SERVER_NAME:-echovault}.key --ssl-certfile /app/certs/tls/$${SERVER_NAME:-echovault}.crt
     ports:
       - "8443:8443"
     depends_on:

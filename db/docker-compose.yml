@@ -23,14 +23,15 @@ services:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     # Postgres insists the key be owned by its user with mode 0600, which a
     # read-only bind mount can't guarantee — copy the pair into place first.
-    command: >
-      sh -c "install -o postgres -g postgres -m 600 /certs/db.key /var/lib/postgresql/db.key &&
-             install -o postgres -g postgres -m 644 /certs/db.crt /var/lib/postgresql/db.crt &&
-             exec docker-entrypoint.sh postgres
-               -c ssl=on
-               -c ssl_cert_file=/var/lib/postgresql/db.crt
-               -c ssl_key_file=/var/lib/postgresql/db.key
-               -c hba_file=/etc/postgresql/pg_hba.conf"
+    # (List form on purpose: a folded scalar here once kept the newlines of the
+    # indented -c lines, so postgres started without ssl=on at all.)
+    command:
+      - sh
+      - -c
+      - |
+        install -o postgres -g postgres -m 600 /certs/db.key /var/lib/postgresql/db.key &&
+        install -o postgres -g postgres -m 644 /certs/db.crt /var/lib/postgresql/db.crt &&
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/db.crt -c ssl_key_file=/var/lib/postgresql/db.key -c hba_file=/etc/postgresql/pg_hba.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-echovault} -d $${POSTGRES_DB:-echovault}"]
       interval: 5s

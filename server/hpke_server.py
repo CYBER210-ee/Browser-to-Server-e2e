@@ -235,6 +235,15 @@ def load_server_keys() -> ServerKeys:
     ed25519_hex = os.environ.get("SERVER_ED25519_PRIVATE_KEY_HEX", "").strip().strip('"').strip("'")
     if not ed25519_hex:
         raise RuntimeError("SERVER_ED25519_PRIVATE_KEY_HEX not set. Run generate_keys.py.")
+    if len(ed25519_hex) != 64 or any(c not in "0123456789abcdefABCDEF" for c in ed25519_hex):
+        # The two classic paste mistakes: the whole NAME=value line after the '=',
+        # or the base64url browser pin instead of the hex private key.
+        raise RuntimeError(
+            "SERVER_ED25519_PRIVATE_KEY_HEX must be exactly 64 hex characters "
+            f"(got {len(ed25519_hex)} characters starting {ed25519_hex[:6]!r}). "
+            "Paste only the value after '=' from generate_keys.py — the base64url pin "
+            "it also prints belongs in the browser, not here."
+        )
 
     ed25519_priv      = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(ed25519_hex))
     ed25519_pub_bytes = ed25519_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)

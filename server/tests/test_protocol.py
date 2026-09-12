@@ -318,6 +318,16 @@ def test_history_must_be_first_s2c_frame(server_keys):
 
 # ── ADR 2: ephemeral recipient keys and their gates ──────────────────────────
 
+@pytest.mark.parametrize("bad", [
+    "SERVER_ED25519_PRIVATE_KEY_HEX=" + "ab" * 32,   # whole line pasted after the '='
+    "sQZN15q8euUzuIcJ6D1t99BR-ltN078vmHq_LJYwpPM",   # the browser pin, not the key
+    "ab" * 31,                                        # too short
+])
+def test_load_server_keys_rejects_malformed_hex(monkeypatch, bad):
+    monkeypatch.setenv("SERVER_ED25519_PRIVATE_KEY_HEX", bad)
+    with pytest.raises(RuntimeError, match="64 hex characters"):
+        H.load_server_keys()
+
 def test_pubkey_transcript_is_pin_only(server_keys):
     t = H.build_t_pubkey(server_keys.ed25519_pub_bytes)
     assert t == b"echovault/pubkey/v2" + server_keys.ed25519_pub_bytes and len(t) == 51
