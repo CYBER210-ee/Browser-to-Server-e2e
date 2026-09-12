@@ -1,14 +1,13 @@
-# ── EchoVault echo server (FastAPI + uvicorn) ────────────────────────────────
-# Plain-HTTP/WebSocket backend. TLS is terminated upstream by mitmproxy, so this
-# container only ever speaks clear ws/http on the internal proxynet network.
+# ── EchoVault echo server (FastAPI + uvicorn, TLS) ───────────────────────────
+# Speaks HTTPS/WSS itself on 8443 with its own certificate (D030). Certs are
+# mounted at /app/certs (see certs/gen-server-certs.sh); settings come from the
+# compose env_file — nothing secret is baked into the image.
 FROM python:3.12-slim
 WORKDIR /app
 # Install deps first so Docker can cache this layer across code changes.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# hpke_server.py is the crypto core imported by main.py
-COPY main.py hpke_server.py secure_link.py history_store.py .env .
-# Listens on 8000 inside the container (reachable as server:8000 on proxynet).
-EXPOSE 8000
-# 0.0.0.0 so the proxy container can reach it. No --reload in production.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY main.py hpke_server.py secure_link.py history_store.py generate_keys.py .
+EXPOSE 8443
+# Shell form so SERVER_NAME (the cert name, D031) expands at start time.
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile /app/certs/${SERVER_NAME:-echovault}.key --ssl-certfile /app/certs/${SERVER_NAME:-echovault}.crt"]

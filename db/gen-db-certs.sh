@@ -11,7 +11,7 @@
 #   SAN_HOSTS="db localhost echo.db.test" ./gen-db-certs.sh
 #   SAN_IPS="10.188.199.221" ./gen-db-certs.sh      # only if you dial by IP
 #
-# The CA is reused across runs (same as mitmproxy/gen-certs.sh); only the leaf
+# The CA is reused across runs (same as server/certs/gen-server-certs.sh); only the leaf
 # is reissued. FORCE_CA=1 mints a new CA — then redistribute db-ca.crt.
 set -euo pipefail
 

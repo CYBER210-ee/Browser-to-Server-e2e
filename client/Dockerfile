@@ -8,10 +8,10 @@ FROM node:22-alpine AS build
 WORKDIR /app
 
 # The API base URL is baked into the browser bundle at BUILD time
-# (NEXT_PUBLIC_* vars are inlined by Next.js). Point it at the proxy hostname.
-# page.tsx reads NEXT_PUBLIC_API_URL and DERIVES the WebSocket URL from it
-# (https → wss), so this single https:// value covers both /pubkey and /ws.
-ARG NEXT_PUBLIC_API_URL=https://echo.server.test
+# (NEXT_PUBLIC_* vars are inlined by Next.js). Point it at the echo server the
+# browser should reach — the server's own TLS port locally (D030), the proxy's
+# public name in the cloud. page.tsx derives the WebSocket URL (https → wss).
+ARG NEXT_PUBLIC_API_URL=https://localhost:8443
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
 COPY package.json package-lock.json ./
@@ -32,8 +32,7 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
 COPY --from=build /app/next.config.ts ./next.config.ts
 
-# Reachable as client:3000 on proxynet.
 EXPOSE 3000
 
-# Bind all interfaces so the proxy container can reach it.
+# Bind all interfaces so the published port reaches it.
 CMD ["npx", "next", "start", "-H", "0.0.0.0", "-p", "3000"]

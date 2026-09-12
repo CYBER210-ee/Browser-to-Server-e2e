@@ -57,4 +57,7 @@ node_modules/
 # ADR 212: sealed epoch keys and DB certs never leave the box they were made on
 *.sqlite3
 *.sqlite3-*
-echovault-deploy/echo_db/certs/
+db/certs/
+server/certs/*.key
+server/certs/*.crt
+server/certs/*.srl
