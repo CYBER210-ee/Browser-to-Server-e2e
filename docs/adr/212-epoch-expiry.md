@@ -93,6 +93,17 @@ mitmproxy (folder left untouched) · channel forward secrecy (next ADR).
 ### 7. Delivery
 - [ ] Initial PR opened for manual review; follow-up PRs for fixes
 
+## Follow-ups agreed (not in this PR)
+
+- **ADR 2 — per-connection channel forward secrecy.** Ephemeral recipient keys both ways,
+  server-first `server_key` frame, `/pubkey` trimmed to the Ed25519 pin.
+- **ADR 3 — retire `echovault-deploy/`.** The proxy stack is no longer part of the demo.
+  Move the Dockerfiles into `client/` and `server/`, move `echo_db/` to a top-level `db/`,
+  put the three-service compose at the repo root, drop the mitmproxy stack, the
+  `01..03` scripts and `GUIDEv2.md`, then delete the directory. Until then the tracked
+  demo `.env` under `echo_server/` stays as it is on `main`; new settings live in the
+  `.env.example` files only.
+
 ## Dependencies (approved)
 
 `psycopg[binary]`, `pytest` (server). SQLite is standard library. Nothing new on the client.

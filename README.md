@@ -182,8 +182,8 @@ client checks.
 #### Everything in Docker
 ```bash
 cd echovault-deploy
-./echo_db/gen-db-certs.sh && cp echo_db/.env.example echo_db/.env      # edit password
-# echo_server/.env: server keys (python generate_keys.py) + DATABASE_URL with the same password, host `db`
+./echo_db/gen-db-certs.sh && cp echo_db/.env.example echo_db/.env            # edit password
+cp echo_server/.env.example echo_server/.env   # server keys (python generate_keys.py) + the same password
 docker compose up -d --build      # client :3000 · server :8000 · db :5432
 ```
 The client image bakes `NEXT_PUBLIC_API_URL=http://localhost:8000`; change the build

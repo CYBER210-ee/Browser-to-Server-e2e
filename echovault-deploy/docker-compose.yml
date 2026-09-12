@@ -5,7 +5,7 @@
 # included from echo_db/ so the same definition runs alone on another box.
 #
 #   ./echo_db/gen-db-certs.sh && cp echo_db/.env.example echo_db/.env   # edit password
-#   (echo_server/.env: server keys + DATABASE_URL, see README)
+#   cp echo_server/.env.example echo_server/.env   # server keys + DATABASE_URL
 #   docker compose up -d --build
 include:
   - path: ./echo_db/docker-compose.yml
