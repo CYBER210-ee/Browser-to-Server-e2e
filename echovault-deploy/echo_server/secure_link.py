@@ -21,12 +21,21 @@ Send = Callable[[str], Awaitable[None]]
 async def serve_secure_link(recv: Recv, send: Send, keys: ServerKeys, history: HistoryService) -> None:
     """
     One HPKE connection, start to finish (§5.6):
-      AWAIT_HELLO → (hello) → server_hello + history push → ESTABLISHED → (msg | epoch_key)…
+      server_key → AWAIT_HELLO → (hello) → server_hello + history push → ESTABLISHED → (msg | epoch_key)…
     Raises ProtocolError on any protocol fault; the caller closes the transport.
     Split from the WebSocket so tests can drive it with plain coroutines.
     """
     session = ServerSession(keys=keys)
+    try:
+        # The server speaks first (D027): this connection's ephemeral recipient key,
+        # signed by the identity, before the browser has said anything.
+        await send(json.dumps(session.server_key_frame()))
+        await _frame_loop(session, recv, send, history)
+    finally:
+        session.wipe()                       # nothing per-connection outlives the socket (D026)
 
+
+async def _frame_loop(session: ServerSession, recv: Recv, send: Send, history: HistoryService) -> None:
     while True:
         try:
             frame = json.loads(await recv())

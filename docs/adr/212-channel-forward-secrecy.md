@@ -50,13 +50,13 @@ the proxy · the deploy directory (ADR 3).
       limitation removed; L2/L3 rows; key-management limitation rewritten
 
 ### 2. Server (`server/hpke_server.py`, `server/secure_link.py`, `server/main.py`)
-- [ ] Per-session ephemeral X25519 keypair; `server_key` frame + `T_server_key`
-- [ ] `v2` labels; `T_hello` / `T_server_hello` over ephemerals; server gate checks its own
+- [x] Per-session ephemeral X25519 keypair; `server_key` frame + `T_server_key`
+- [x] `v2` labels; `T_hello` / `T_server_hello` over ephemerals; server gate checks its own
       ephemeral in `hello`
-- [ ] `SESSION_ID` over three transcripts
-- [ ] `/pubkey` without `server_x25519`; `T_pubkey` v2
-- [ ] Ephemeral private key dropped at session end
-- [ ] Mirror into `echovault-deploy/echo_server/`
+- [x] `SESSION_ID` over three transcripts
+- [x] `/pubkey` without `server_x25519`; `T_pubkey` v2
+- [x] Ephemeral private key dropped at session end
+- [x] Mirror into `echovault-deploy/echo_server/`
 
 ### 3. Client (`client/app/page.tsx`)
 - [ ] Verify: `/pubkey` v2 (Ed25519 pin only)
@@ -66,11 +66,11 @@ the proxy · the deploy directory (ADR 3).
 - [ ] Ephemeral scalar zeroed on teardown; static X25519 used only for storage seals
 
 ### 4. Tests
-- [ ] `PyBrowser` speaks the new handshake; existing history tests still pass
-- [ ] Gates: bad `server_key` sig / wrong pin key · `hello` sealed to a wrong server
+- [x] `PyBrowser` speaks the new handshake; existing history tests still pass
+- [x] Gates: bad `server_key` sig / wrong pin key · `hello` sealed to a wrong server
       ephemeral · `server_hello` with a swapped browser ephemeral
-- [ ] Two connections → different `enc`s and `SESSION_ID`s
-- [ ] Forward secrecy: a captured c2s `ct` does not open with the server's static key
+- [x] Two connections → different `enc`s and `SESSION_ID`s
+- [x] Forward secrecy: a captured c2s `ct` does not open with the server's static key
 - [ ] `npm run lint` / `npm run build`
 
 ### 5. Delivery

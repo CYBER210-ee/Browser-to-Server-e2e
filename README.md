@@ -56,9 +56,9 @@ This project includes:
 This project does not attempt to build a production LLM gateway or connect to a real LLM provider; the echo server is used to keep the demo simple and focused on network security. 
 
 **Stretch goals (only if Week 4 checkpoint is green):**
-- **Headline — Forward-secrecy epoch ratchet:** rotate the recipient key material on a
-  schedule so a stolen static key can't decrypt recorded traffic (restores the forward secrecy that a
-  static BIP-39 recipient key trades away).
+- **Headline — Forward secrecy:** ✅ delivered as per-connection ephemeral recipient keys
+  (ADR 2, D026–D028): a stolen static key can't decrypt recorded traffic. Mid-session rotation
+  remains open.
 - Multi-recipient HPKE seal (`{server, second-recipient}`, the VG `{supervisor, tenant}` shape);
   post-quantum hybrid X25519+ML-KEM-768; vendoring `hpke-js` for an offline demo; WebAuthn-gated
   mnemonic unlock; an untrusted-relay demo.
@@ -151,7 +151,7 @@ cd server
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cp .env.example .env
-python generate_keys.py           # paste the two SERVER_*_PRIVATE_KEY_HEX lines into .env
+python generate_keys.py           # paste the SERVER_ED25519_PRIVATE_KEY_HEX line into .env
 ```
 Edit `.env`: `DATABASE_URL` must match the database's user/password/host and stay
 `sslmode=verify-full`; `DB_SSLROOTCERT` points at `db-ca.crt`; `EPOCH_LENGTH` and

@@ -1,7 +1,8 @@
 """
-Full secure link with a Python-side browser (pyhpke both sides): handshake,
-history push, epoch_key upload, structured msg, and the fail-closed gates
-(ADR 212 / protocol §5.4.1, §5.4.2, §5.6, §7.5, §9).
+Full secure link with a Python-side browser (pyhpke both sides): server_key /
+hello / server_hello with per-connection ephemerals (ADR 2), history push,
+epoch_key upload, structured msg, and the fail-closed gates
+(protocol §4.0–§4.3, §5.4.1, §5.4.2, §5.6, §7.5, §9).
 """
 
 import asyncio
@@ -37,26 +38,39 @@ class PyBrowser:
 
     def __init__(self, server_keys: H.ServerKeys, identity_seed: bytes | None = None):
         seed = identity_seed or os.urandom(32)
-        self.x_kp   = H.SUITE.kem.derive_key_pair(seed)               # static identity (§2)
+        self.x_kp   = H.SUITE.kem.derive_key_pair(seed)               # static identity: STORAGE only (§2, D026)
         self.ed     = Ed25519PrivateKey.from_private_bytes(H.hashlib.sha256(b"ed" + seed).digest())
         self.x_pub  = self.x_kp.public_key.to_public_bytes()
         self.ed_pub = self.ed.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-        self.pin_x, self.pin_ed = server_keys.x25519_pub_bytes, server_keys.ed25519_pub_bytes
+        self.pin_ed = server_keys.ed25519_pub_bytes                   # the out-of-band pin
         self.epochs: dict[bytes, object] = {}                           # epoch_id → epoch keypair
         self.reset()
 
     def reset(self):
-        self.sender = self.recipient = self.session_id = self.t_hello = None
+        self.sender = self.recipient = self.session_id = None
+        self.t_server_key = self.t_hello = None
+        self.eph_kp = self.eph_pub = self.server_eph = None            # per-connection (D026)
         self.c2s_seq, self.s2c_seq = 0, 0
         self.history = None
 
-    # handshake (§4.2 / §4.3.1)
-    def hello(self) -> str:
+    # handshake (§4.0.1 / §4.2 / §4.3.1)
+    def accept_server_key(self, raw: str):
+        f = json.loads(raw)
+        assert f["type"] == "server_key", f
+        eph, sig = H.b64url_decode(f["server_x25519"]), H.b64url_decode(f["sig"])
+        t = H.build_t_server_key(eph, self.pin_ed)                     # rebuilt from the PIN
+        Ed25519PublicKey.from_public_bytes(self.pin_ed).verify(sig, t)
+        self.server_eph, self.t_server_key = eph, t
+
+    def hello(self, server_eph: bytes | None = None) -> str:
+        """Mint our ephemeral, seal c2s to the server ephemeral (or a wrong one, for tests)."""
+        self.eph_kp, self.eph_pub = H.mint_ephemeral()
+        target = server_eph or self.server_eph
         enc, self.sender = H.SUITE.create_sender_context(
-            H.SUITE.kem.deserialize_public_key(self.pin_x), info=H.HPKE_INFO)
-        self.t_hello = H.build_t_hello(self.x_pub, self.ed_pub, enc, self.pin_x, self.pin_ed)
+            H.SUITE.kem.deserialize_public_key(target), info=H.HPKE_INFO)
+        self.t_hello = H.build_t_hello(self.eph_pub, self.ed_pub, enc, target, self.pin_ed)
         return json.dumps({
-            "type": "hello", "browser_x25519": H.b64url_encode(self.x_pub),
+            "type": "hello", "browser_x25519": H.b64url_encode(self.eph_pub),
             "browser_ed25519": H.b64url_encode(self.ed_pub), "enc": H.b64url_encode(enc),
             "sig": H.b64url_encode(self.ed.sign(self.t_hello)),
         })
@@ -65,10 +79,11 @@ class PyBrowser:
         f = json.loads(raw)
         assert f["type"] == "server_hello"
         enc, sig = H.b64url_decode(f["enc"]), H.b64url_decode(f["sig"])
-        t = H.build_t_server_hello(enc, self.x_pub, self.ed_pub, self.pin_x, self.pin_ed)
+        # §4.3.1: rebuilt from OUR ephemeral + the server ephemeral we accepted + the pin
+        t = H.build_t_server_hello(enc, self.eph_pub, self.ed_pub, self.server_eph, self.pin_ed)
         Ed25519PublicKey.from_public_bytes(self.pin_ed).verify(sig, t)
-        self.session_id = H.compute_session_id(self.t_hello, t)
-        self.recipient = H.SUITE.create_recipient_context(enc, self.x_kp.private_key, info=H.HPKE_INFO)
+        self.session_id = H.compute_session_id(self.t_server_key, self.t_hello, t)
+        self.recipient = H.SUITE.create_recipient_context(enc, self.eph_kp.private_key, info=H.HPKE_INFO)
 
     # sealed frames (§7.2)
     def seal(self, wire_type: str, frame_type: bytes, pt: bytes, aad_type: bytes | None = None) -> str:
@@ -169,7 +184,6 @@ class Link:
 @pytest.fixture
 def server_keys(monkeypatch):
     g = H.generate_server_keys()
-    monkeypatch.setenv("SERVER_X25519_PRIVATE_KEY_HEX", g["SERVER_X25519_PRIVATE_KEY_HEX"])
     monkeypatch.setenv("SERVER_ED25519_PRIVATE_KEY_HEX", g["SERVER_ED25519_PRIVATE_KEY_HEX"])
     return H.load_server_keys()
 
@@ -183,9 +197,10 @@ def history(tmp_path):
 
 
 async def connect(browser: PyBrowser, keys, history) -> tuple[Link, dict]:
-    """hello → server_hello → history; returns the link ESTABLISHED and the history plaintext."""
+    """server_key → hello → server_hello → history; returns the ESTABLISHED link + history plaintext."""
     browser.reset()
     link = Link(keys, history)
+    browser.accept_server_key(await link.recv())
     await link.send(browser.hello())
     browser.accept_server_hello(await link.recv())
     h = browser.accept_history(await link.recv())
@@ -280,6 +295,7 @@ def test_wrong_frame_types_per_phase(server_keys, history):
     async def go():
         b = PyBrowser(server_keys)
         link = Link(server_keys, history)
+        await link.recv()                                          # server_key
         await link.send(json.dumps({"type": "epoch_key", "seq": "0" * 16, "ct": "AA"}))
         assert "expected hello" in str(await link.expect_fault())
 
@@ -292,11 +308,106 @@ def test_wrong_frame_types_per_phase(server_keys, history):
 def test_history_must_be_first_s2c_frame(server_keys):
     s = H.ServerSession(keys=server_keys)
     b = PyBrowser(server_keys)
+    b.accept_server_key(json.dumps(s.server_key_frame()))
     sh = s.handle_hello(json.loads(b.hello()))
     b.accept_server_hello(json.dumps(sh))
     s.seal_reply(b"ECHO: x")
     with pytest.raises(H.ProtocolError):
         s.seal_history({"policy": {}, "epochs": [], "records": []})
+
+
+# ── ADR 2: ephemeral recipient keys and their gates ──────────────────────────
+
+def test_pubkey_transcript_is_pin_only(server_keys):
+    t = H.build_t_pubkey(server_keys.ed25519_pub_bytes)
+    assert t == b"echovault/pubkey/v2" + server_keys.ed25519_pub_bytes and len(t) == 51
+
+
+def test_each_connection_gets_fresh_ephemerals_and_session_ids(server_keys, history):
+    async def go():
+        b = PyBrowser(server_keys)
+        seen_server, seen_browser, seen_sid = set(), set(), set()
+        for _ in range(3):
+            link, _ = await connect(b, server_keys, history)
+            seen_server.add(b.server_eph); seen_browser.add(b.eph_pub); seen_sid.add(b.session_id)
+            link.close()
+        assert len(seen_server) == len(seen_browser) == len(seen_sid) == 3
+        assert b.x_pub not in seen_browser                        # static key never on the channel
+    asyncio.run(go())
+
+
+def test_server_key_with_wrong_identity_is_rejected_by_browser(server_keys, history):
+    """A proxy re-signing server_key with its own Ed25519 fails the §4.0.1 pin check."""
+    async def go():
+        b = PyBrowser(server_keys)
+        link = Link(server_keys, history)
+        f = json.loads(await link.recv())
+        rogue = Ed25519PrivateKey.generate()
+        rogue_pub = rogue.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        f["sig"] = H.b64url_encode(rogue.sign(H.build_t_server_key(H.b64url_decode(f["server_x25519"]), rogue_pub)))
+        with pytest.raises(Exception):                                 # cryptography.InvalidSignature
+            b.accept_server_key(json.dumps(f))
+        link.close()
+    asyncio.run(go())
+
+
+def test_hello_sealed_to_another_servers_ephemeral_is_rejected(server_keys, history):
+    """The server gate (§4.2) requires T_hello to name THIS connection's ephemeral."""
+    async def go():
+        b = PyBrowser(server_keys)
+        link = Link(server_keys, history)
+        b.accept_server_key(await link.recv())
+        stale_kp, stale_pub = H.mint_ephemeral()                       # e.g. a previous connection's key
+        await link.send(b.hello(server_eph=stale_pub))
+        assert "hello sig verification failed" in str(await link.expect_fault())
+    asyncio.run(go())
+
+
+def test_server_hello_with_swapped_browser_ephemeral_fails_gate(server_keys, history):
+    """§4.3.1 step 3: the browser must see its OWN ephemeral echoed back."""
+    async def go():
+        b = PyBrowser(server_keys)
+        link = Link(server_keys, history)
+        b.accept_server_key(await link.recv())
+        await link.send(b.hello())
+        raw = await link.recv()
+        _, other_pub = H.mint_ephemeral()
+        real_pub = b.eph_pub
+        b.eph_pub = other_pub                                          # pretend the transcript carried a proxy key
+        with pytest.raises(Exception):
+            b.accept_server_hello(raw)
+        b.eph_pub = real_pub
+        b.accept_server_hello(raw)                                     # the genuine transcript verifies
+        link.close()
+    asyncio.run(go())
+
+
+def test_forward_secrecy_captured_ct_does_not_open_after_teardown(server_keys, history):
+    """
+    Record the c2s frames of a session, close it, then try to open them with every key
+    that survives: the server has no static X25519 at all, and its ephemeral is gone.
+    """
+    async def go():
+        b = PyBrowser(server_keys)
+        link, _ = await connect(b, server_keys, history)
+        epoch_id, frame = b.mint_epoch()
+        await link.send(frame)
+        captured = b.msg("harvest me", epoch_id)
+        await link.send(captured)
+        b.open(await link.recv(), "msg", H.TYPE_MSG)
+        link.close()
+        await asyncio.sleep(0)                                         # let the loop's finally run wipe()
+
+        assert not hasattr(server_keys, "x25519_kp")                   # nothing static to steal (D028)
+        # Even the browser's own static identity key cannot open the s2c side: the reply
+        # was sealed to the browser EPHEMERAL, and the c2s enc was sealed to the server's.
+        c2s = json.loads(captured)
+        aad = H.make_aad(H.DIR_C2S, b.session_id, H.hex_to_seq(c2s["seq"]))
+        with pytest.raises(Exception):
+            H.SUITE.create_recipient_context(
+                H.b64url_decode(c2s["ct"])[:32], b.x_kp.private_key, info=H.HPKE_INFO
+            ).open(H.b64url_decode(c2s["ct"]), aad=aad)
+    asyncio.run(go())
 
 
 def test_expired_epoch_makes_records_unrecoverable(server_keys, tmp_path, monkeypatch):

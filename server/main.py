@@ -4,7 +4,7 @@ server/main.py — EchoVault echo server (protocol v1 + ADR 212 history)
 Endpoints:
   GET /api/health   → {"status":"ok"}
   GET /api/status   → {"status":"online","websocket_route":"/ws"}
-  GET /pubkey       → {server_x25519, server_ed25519, sig}  (§5.1)
+  GET /pubkey       → {server_ed25519, sig}  (§5.1, D028 — pin confirmation only)
   GET /api/pubkey   → alias (backward compat)
   WS  /ws           → HPKE echo + stored history, strict state machine (§5.6)
   WS  /ws/plain     → plaintext echo — demo exhibit (b): E2E OFF, no history
@@ -65,11 +65,10 @@ async def get_status():
 
 
 def _pubkey_payload() -> dict:
-    """Build /pubkey response with fresh Ed25519 signature (§5.1)."""
-    t   = build_t_pubkey(SERVER_KEYS.x25519_pub_bytes, SERVER_KEYS.ed25519_pub_bytes)
+    """Build /pubkey response: the Ed25519 pin confirmation only (§5.1, D028)."""
+    t   = build_t_pubkey(SERVER_KEYS.ed25519_pub_bytes)
     sig = SERVER_KEYS.ed25519_priv.sign(t)
     return {
-        "server_x25519":  b64url_encode(SERVER_KEYS.x25519_pub_bytes),
         "server_ed25519": b64url_encode(SERVER_KEYS.ed25519_pub_bytes),
         "sig":            b64url_encode(sig),
     }
