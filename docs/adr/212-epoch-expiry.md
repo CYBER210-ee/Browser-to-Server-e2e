@@ -1,6 +1,6 @@
 # ADR 212 — Mnemonic-owned chat history with epoch expiry
 
-Branch: `212/epoch_expiry` · Status: implemented, initial PR pending review · Next ADR: per-connection channel forward secrecy
+Branch: `212/epoch_expiry` · Status: implemented on branch 212/epoch_expiry, awaiting push + manual review · Next ADR: per-connection channel forward secrecy
 
 ## Goal
 
