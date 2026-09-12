@@ -908,6 +908,7 @@ reconstructed by the browser from values it already holds; it is never on the wi
 | epoch length | `EPOCH_LENGTH` | `1h` | the browser reuses the newest live epoch while `now − created_at < EPOCH_LENGTH`, otherwise mints a new one |
 | window | `HISTORY_WINDOW` | `7d` | the server **erases** a sealed epoch key once `now − created_at ≥ HISTORY_WINDOW` |
 | cap | `HISTORY_MAX_RECORDS` | `500` | most recent records included in the `history` push |
+| server name | `SERVER_NAME` | `echovault` | files records under this server; history is **per server** (D031) — a browser gets back only what it stored with *this* server |
 
 Durations accept `s`, `m`, `h`, `d` suffixes. Consequences of the two timers: a record is
 **guaranteed unrecoverable** by `created_at(epoch) + HISTORY_WINDOW` and **kept for at
@@ -927,7 +928,7 @@ sweeper on every new connection (before building `history`) and on a periodic ta
 |------|---------|-------------|
 | mnemonic → static X25519 scalar (storage identity, §2) | browser (derived on load); never on the channel (D026) | browser only |
 | `epoch_sk` (live epochs) | browser memory for the session; **sealed** copy on the server host (SQLite) | browser only |
-| records `{enc_r, ct_r}` | remote Postgres (TLS, `verify-full`) | browser only, and only while the epoch key exists |
+| records `{enc_r, ct_r}` | remote Postgres (TLS, `verify-full`), filed under `server_name` (D031) | browser only, and only while the epoch key exists on the server it talked to |
 | `owner_ed25519`, `epoch_id`, `created_at` | server host + remote Postgres | server (metadata, by design) |
 
 The browser persists **nothing** for history: with the words it re-obtains everything from
@@ -942,3 +943,6 @@ These endpoints do not carry decrypted prompt content.
 - `/pubkey` — public keys + transcript signature (§5.1); public by design
 - `/ws` — transport endpoint; prompt payloads and stored-history material appear only
   as encrypted `ct` fields after handshake setup (`msg`, `epoch_key`, `history`)
+
+All endpoints are served over TLS by the echo server itself (D030); there is no plaintext
+echo endpoint (D029).
