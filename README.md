@@ -127,7 +127,7 @@ what that server holds. Checks: `npm run lint`, `npm run build`.
 ```bash
 ./db/gen-db-certs.sh && cp db/.env.example db/.env               # edit password
 ./server/certs/gen-server-certs.sh                                # SAN covers localhost + server
-cp server/.env.example server/.env                                # identity + DATABASE_URL (host `db`, same password)
+cp server/.env.example server/.env                                # identity + the db password in DATABASE_URL
 docker compose up -d --build                                      # client :3000 · server :8443 · db :5432
 ```
 To run the database elsewhere, bring up `db/docker-compose.yml` on that box, point `DATABASE_URL`

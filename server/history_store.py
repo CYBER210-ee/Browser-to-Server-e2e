@@ -220,15 +220,19 @@ class PostgresRecordStore:
     cost we pay per call — fine at demo volume).
 
     The DSN MUST carry sslmode=verify-full (fail closed at construction); the CA
-    can come from the DSN's sslrootcert or from DB_SSLROOTCERT.
+    can come from the DSN's sslrootcert or from DB_SSLROOTCERT. `host` lets the
+    compose file point one and the same .env at the `db` service instead of
+    localhost — inside a container, localhost is the container.
     """
 
-    def __init__(self, dsn: str, sslrootcert: str | None = None):
+    def __init__(self, dsn: str, sslrootcert: str | None = None, host: str | None = None):
         import psycopg
         from psycopg import conninfo
         params = conninfo.conninfo_to_dict(dsn)
         if sslrootcert and "sslrootcert" not in params:
             params["sslrootcert"] = sslrootcert
+        if host:
+            params["host"] = host
         if params.get("sslmode") != "verify-full":
             raise RuntimeError("DATABASE_URL must set sslmode=verify-full (D024)")
         if not params.get("sslrootcert"):
@@ -350,6 +354,7 @@ def open_history_service(server_name: str = "echovault") -> HistoryService:
       HISTORY_BACKEND   'postgres' (default) or 'memory' (dev only — nothing persists)
       DATABASE_URL      postgresql://…?sslmode=verify-full&sslrootcert=… (postgres backend)
       DB_SSLROOTCERT    CA path if not in DATABASE_URL
+      DB_HOST           overrides the DSN's host (compose sets it to `db`)
     """
     policy  = load_policy()
     epochs  = EpochKeyStore(os.environ.get("EPOCH_DB_PATH", "./epoch_keys.sqlite3"))
@@ -361,7 +366,9 @@ def open_history_service(server_name: str = "echovault") -> HistoryService:
         dsn = os.environ.get("DATABASE_URL", "").strip()
         if not dsn:
             raise RuntimeError("DATABASE_URL not set (or HISTORY_BACKEND=memory for a dev run)")
-        records = PostgresRecordStore(dsn, os.environ.get("DB_SSLROOTCERT") or None)
+        records = PostgresRecordStore(
+            dsn, os.environ.get("DB_SSLROOTCERT") or None, os.environ.get("DB_HOST") or None,
+        )
     else:
         raise RuntimeError(f"unknown HISTORY_BACKEND {backend!r}")
     return HistoryService(epochs, records, policy, server_name)
