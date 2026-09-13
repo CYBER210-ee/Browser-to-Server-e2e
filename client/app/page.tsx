@@ -5,10 +5,13 @@
  * WHAT CHANGED vs the plain chat version?
  *   1) The mnemonic is loaded from the Identity page (localStorage "mnemonic")
  *      and turned into the browser's two key pairs (protocol.md §2).
- *   2) A "Server key" text box + Verify button: paste the server's Ed25519
- *      public key (the PIN printed in the server console). Verify fetches
- *      /pubkey and runs the §4.1.1 pin gate; a green stoplight means the
- *      served key matched your pin AND its signature checked out.
+ *   2) A "Server key" text box + Verify button. On load the box is filled
+ *      from the server's own /pubkey (D032) so a rebuilt server with a new
+ *      identity needs no copy-paste — trust on first use, and the page says
+ *      so. Paste the PIN printed in the server console over it to get the
+ *      real out-of-band check back. Verify fetches /pubkey again and runs
+ *      the §4.1.1 pin gate; a green stoplight means the served key matched
+ *      the pin AND its signature checked out.
  *   3) After a green light, the page opens the WebSocket and waits for the
  *      server's signed `server_key` — a fresh X25519 key minted for THIS
  *      connection (§4.0, ADR 2). It checks it against the pin, mints its own
@@ -243,6 +246,10 @@ interface ChatMessage {
 // Traffic-light states for the server-key check.
 type PinStatus = 'unchecked' | 'valid' | 'invalid';
 
+// Where the pin in the box came from (D032). 'server' is trust on first use:
+// the key was learned from the same server it is about to authenticate.
+type PinSource = 'server' | 'pasted';
+
 /* ----------------------------------------------------------------------------
  * THE COMPONENT
  * -------------------------------------------------------------------------- */
@@ -273,10 +280,14 @@ export default function ChatApp() {
   const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ------------------------- EchoVault state ---------------------------- */
-  // The pasted server public key (Ed25519, base64url) — the PIN. This is the
-  // demo's out-of-band trust root: it must come to you OUTSIDE the connection
-  // (the server prints it in its own console at startup).
-  const [serverPinInput, setServerPinInput] = useState('sQZN15q8euUzuIcJ6D1t99BR-ltN078vmHq_LJYwpPM');
+  // The server public key (Ed25519, base64url) — the PIN. The real trust root
+  // is a pin that comes to you OUTSIDE the connection (the server prints it in
+  // its own console at startup). For the demo the box is pre-filled from
+  // /pubkey on load instead (D032) — see pinSource.
+  const [serverPinInput, setServerPinInput] = useState('');
+  const [pinSource, setPinSource] = useState<PinSource>('pasted');
+  // Set once the user types in the box, so a slow /pubkey never overwrites it.
+  const pinEdited = useRef(false);
   // Traffic light: did the served /pubkey match the pasted pin + valid signature?
   const [pinStatus, setPinStatus] = useState<PinStatus>('unchecked');
   const [hasSavedMnemonic, setHasSavedMnemonic] = useState(false);
@@ -385,9 +396,33 @@ const httpBase =
 const wsBase =
   process.env.NEXT_PUBLIC_WS_URL ?? httpBase.replace(/^http/, 'ws');
 
+  /* ---------- pre-fill the pin from the server itself (D032, TOFU) -------- */
+  // The self-licking ice cream, on purpose: we ask the server which key to
+  // trust and then check the server against that answer. Whoever answers this
+  // first fetch — the server, or anything that terminates TLS in front of it —
+  // chooses the pin, and every gate below then passes against THEIR key. It
+  // saves re-pasting after every rebuild; pasting the console pin over it is
+  // what restores the out-of-band guarantee of §4.1.1.
+  useEffect(() => {
+    fetch(`${httpBase}/pubkey`)
+      .then((res) => res.json())
+      .then((pk) => {
+        unb64u(pk.server_ed25519, 32);             // well-formed or nothing
+        if (pinEdited.current) return;
+        setServerPinInput(pk.server_ed25519);
+        setPinSource('server');
+      })
+      .catch(() => {
+        if (!pinEdited.current)
+          setStatusNote('Could not fetch /pubkey — is the server up and its CA trusted? Paste the pin from the server console.');
+      });
+  }, [httpBase]);
+
   /* ------------------- VERIFY BUTTON: the §4.1.1 pin gate ---------------- */
   // What happens when you click Verify, in plain English:
-  //   1. Take the key YOU pasted (the pin) — that is the only thing we trust.
+  //   1. Take the key in the box (the pin) — that is the only thing we trust.
+  //      If it was pre-filled from /pubkey (D032), steps 3–4 confirm only
+  //      that the server agrees with itself.
   //   2. Fetch /pubkey from the server. Whatever comes back is UNTRUSTED
   //      input; it exists only so we can compare it against the pin.
   //   3. Compare the served signing key to the pin, byte for byte. Mismatch
@@ -408,7 +443,7 @@ const wsBase =
       if (!pinText) {
         // No pin provisioned → refuse to handshake at all (fail closed, §4.1.1).
         setPinStatus('unchecked');
-        setStatusNote('Paste the server public key (printed in the server console).');
+        setStatusNote('No server key — reload to fetch it, or paste the one printed in the server console.');
         return;
       }
       const pinnedEd = unb64u(pinText, 32);
@@ -428,7 +463,9 @@ const wsBase =
       // Step 5 — the pin is confirmed live. Everything else arrives on the socket.
       link.current.pinnedEd = pinnedEd;
       setPinStatus('valid');
-      setStatusNote('Server key verified against pin — establishing encrypted channel…');
+      setStatusNote(pinSource === 'server'
+        ? 'Server key matches the key this server served on load (trust on first use, not out-of-band) — establishing encrypted channel…'
+        : 'Server key verified against pin — establishing encrypted channel…');
 
       await establishChannel();
     } catch {
@@ -860,7 +897,8 @@ const wsBase =
           </span>
 
           {/* Light 2: the /pubkey stoplight. Green ONLY after the served key
-              matched the pasted pin byte-for-byte AND its signature verified. */}
+              matched the pin byte-for-byte AND its signature verified. A pin
+              pre-filled from /pubkey is labelled TOFU (D032). */}
           <span className="cg-keychip">
             <span
               className={`cg-light ${
@@ -869,6 +907,7 @@ const wsBase =
               style={pinStatus === 'unchecked' ? { background: '#999' } : undefined}
             />
             Server Key {pinStatus === 'valid' ? 'Verified' : pinStatus === 'invalid' ? 'REJECTED' : 'Unverified'}
+            {pinSource === 'server' && ' · TOFU'}
           </span>
 
           {/* Light 3: is the end-to-end channel actually up? */}
@@ -878,17 +917,22 @@ const wsBase =
           </span>
         </div>
 
-        {/* The pin box + Verify button. Paste the base64url Ed25519 key the
-            server printed at startup. This must reach you OUT-OF-BAND (read
-            it off the server console yourself) — never trust a key the
-            network handed you. */}
+        {/* The pin box + Verify button. Pre-filled from /pubkey on load
+            (D032) — a key the network handed you, and the TOFU chip says so.
+            Paste the base64url Ed25519 key the server printed at startup to
+            make it OUT-OF-BAND again (read it off the server console yourself). */}
         <div
           className="cg-pinbar"
           style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '8px 16px' }}
         >
           <input
             value={serverPinInput}  className="cg-input"
-            onChange={(e) => { setServerPinInput(e.target.value); setPinStatus('unchecked'); }}
+            onChange={(e) => {
+              pinEdited.current = true;
+              setServerPinInput(e.target.value);
+              setPinSource('pasted');
+              setPinStatus('unchecked');
+            }}
             placeholder="Paste server public key (Ed25519, base64url) from server console"
             style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: '6px 10px' }}
             spellCheck={false}
