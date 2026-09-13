@@ -60,7 +60,7 @@ foundation table are in [`docs/cyber212/README.md`](docs/cyber212/README.md).
   the mnemonic's X25519 key and filed on the server host; records go to Postgres. After
   `HISTORY_WINDOW` the server erases the epoch key and every record of that epoch is unrecoverable
   everywhere. History is per server.
-- **Threat model**: `docs/threat-model.md`. Decisions: `docs/decisions.md` (D001–D031). ADR
+- **Threat model**: `docs/threat-model.md`. Decisions: `docs/decisions.md` (D001–D032). ADR
   checklists: `docs/adr/`.
 
 Layout:
@@ -117,10 +117,11 @@ cd client
 npm ci
 npm run dev                    # http://localhost:3000 → talks to https://localhost:8443
 ```
-Open **Key Vault**, create or paste a 24-word mnemonic, go back, paste the server pin into
-*Server key*, press **Verify**. The page verifies the pin, waits for the server's connection
-key, runs the handshake, receives its history, and the transcript shows what that server
-holds. Checks: `npm run lint`, `npm run build`.
+Open **Key Vault**, create or paste a 24-word mnemonic, go back, press **Verify**. *Server key*
+is pre-filled from the server's `/pubkey` and marked *TOFU* (D032) — paste the pin from the
+server console over it for the out-of-band check. The page verifies the pin, waits for the
+server's connection key, runs the handshake, receives its history, and the transcript shows
+what that server holds. Checks: `npm run lint`, `npm run build`.
 
 ### Everything in Docker
 ```bash

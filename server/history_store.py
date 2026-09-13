@@ -109,11 +109,17 @@ class EpochKeyStore:
     Sealed epoch private keys, keyed by (owner, epoch_id). Lives on the box the
     operator controls so that erasing a row here is what makes history expire.
     Synchronous; HistoryService wraps calls in a worker thread.
+
+    A plain DELETE leaves the row's bytes in free pages and in the WAL, so an
+    "erased" key could be carved out of the file. secure_delete zeroes freed
+    content and erase_expired truncates the WAL; what the filesystem or a disk
+    snapshot keeps below SQLite is out of its reach.
     """
 
     def __init__(self, path: str):
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._db.execute("PRAGMA secure_delete=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS epoch_keys ("
@@ -156,6 +162,10 @@ class EpochKeyStore:
                 "SELECT owner, epoch_id FROM epoch_keys WHERE created_at <= ?", (cutoff,)
             ).fetchall()
             self._db.execute("DELETE FROM epoch_keys WHERE created_at <= ?", (cutoff,))
+            if rows:
+                # Copy the zeroed pages home and drop the WAL frames that still
+                # hold the key as it was inserted.
+                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return [(bytes(r[0]), bytes(r[1])) for r in rows]
 
     def close(self) -> None:

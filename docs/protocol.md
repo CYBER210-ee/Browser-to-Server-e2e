@@ -348,6 +348,11 @@ pin. The browser MUST, on receiving the `/pubkey` response, in order:
 - If no pin is provisioned, the client MUST refuse to run the E2E handshake (fail
   closed) rather than pin-on-first-use.
 
+> **Demo exception (D032).** The reference page pre-fills the pin from `/pubkey` on load and
+> labels it *TOFU*. Run that way it is **not conformant** with this section: the gates above
+> execute, but they compare the server to a key the server supplied. A pin pasted from the
+> server console makes the same page conformant again. Nothing on the wire changes.
+
 ### 4.2 `hello` — signed by the **browser** Ed25519 key
 
 Binds the browser's ephemeral material **to the specific server key it sealed to**
@@ -812,7 +817,8 @@ The browser→server `msg` plaintext is **UTF-8 JSON**, not bare text:
   TLS-terminating proxy can neither substitute the server HPKE key (browser→server) nor
   redirect the echo reply to its own key (server→browser). Both substitutions cause the
   browser to abort **before** any prompt is sealed. This holds **only** while the server
-  Ed25519 identity is a genuine out-of-band pin (§4.1.1); pin-on-first-use voids it.
+  Ed25519 identity is a genuine out-of-band pin (§4.1.1); pin-on-first-use voids it —
+  including the page's pre-filled *TOFU* pin (D032).
 - **Replay / reorder / frame-type confusion (update).** The receiver's `seq` gate
   (§7.3, D019) rejects duplicates/rollbacks/gaps and, under the chosen
   **teardown-and-rehandshake** policy, fails the link closed on any ordering or
