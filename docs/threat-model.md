@@ -36,7 +36,7 @@ This threat model depends on the following assumptions:
 * The delivered JavaScript is trusted for the purpose of the demo.
 * The HPKE and AEAD libraries are implemented correctly and used according to their documentation.
 * The server's Ed25519 identity key is not stolen before or during the demo (theft afterwards no longer exposes recorded traffic, D026, but would allow impersonation).
-* The server public identity key used for pinning is known to the browser through a trusted demo path, such as a hardcoded pin or trusted local configuration.
+* The server public identity key used for pinning is known to the browser through a trusted demo path, such as a pin pasted from the server console. The page's default pre-fills it from `/pubkey` (D032); in that mode this assumption is replaced by trust in whatever terminated TLS for that fetch.
 * The modeled intermediary is a TLS-terminating component (reverse proxy, WAF, gateway, inspection tool) that is not a fully compromised browser or server.
 * The demo uses fake prompt data only.
 * The goal is to protect prompt contents from intermediaries after TLS termination, not from the intended echo server.
@@ -225,6 +225,8 @@ An active proxy could rewrite the `hello` (keep the real `enc`, swap in its own 
 This is closed by two mandatory checks: (1) the browser confirms the `/pubkey` server key against the out-of-band pin and never learns it from the wire (§4.1.1); (2) the browser confirms `server_hello` echoes **its own** browser keys and the **pinned** server keys, byte-for-byte, and aborts before sealing any prompt (§4.3.1).
 
 Both still rest on the server Ed25519 identity being a genuine out-of-band pin; pin-on-first-use voids them.
+
+**The demo default is pin-on-first-use (D032), labelled.** The page pre-fills the pin from `/pubkey` so a rebuilt server needs no copy-paste, and marks it *TOFU*. In that mode the key-substitution defense reduces to the TLS hop that served `/pubkey`: an intermediary terminating that TLS — the reverse proxy + WAF in the cloud target — can serve its own key and signature, and every gate passes against it. Pasting the pin from the server console restores the defense described above.
 
 ---
 

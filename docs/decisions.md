@@ -167,7 +167,7 @@ Go, and Rust.
   sealed, so the fix costs nothing but a comparison. **Tradeoff:** a proxy can still force
   an abort (denial of service) — explicitly out of scope (availability).
 
-### D016 — `/pubkey` is confirmed against the pin, never trusted from the wire ✅
+### D016 — `/pubkey` is confirmed against the pin, never trusted from the wire ✅ *(demo default relaxed by D032)*
 - **Chose:** Treat `server_ed25519` from `/pubkey` as **untrusted input**. The browser
   MUST compare it to a pre-provisioned out-of-band pin **first**, verify the signature
   against the pin, and adopt `server_x25519` only via that pin-anchored signature
@@ -448,3 +448,26 @@ Go, and Rust.
   B cannot decrypt A's records even if it could read them. The `server_name` column exists
   so B does not *serve* A's blobs either (counts and sizes are metadata). With one server it
   is inert.
+
+## CYBER212 Client fixes (ADR 5)
+
+### D032 — The page pre-fills the pin from `/pubkey` (trust on first use, labelled) ✅
+- **Chose:** On load the browser fetches `/pubkey` and fills the *Server key* box with the
+  served `server_ed25519`, unless the user has already typed there. The §4.1.1 gate, the
+  `server_key` check and §4.3.1 run unchanged against whatever is in the box. The page tracks
+  where the pin came from and labels a server-supplied one *TOFU*; pasting the console pin
+  switches back to the out-of-band path. The hardcoded default pin is removed.
+- **Rejected:** (a) Keeping the paste-only flow — every rebuild with a new identity broke the
+  demo until someone copied a key by hand, and a stale hardcoded pin failed red for no
+  reason worth demonstrating. (b) Baking the pin into the client bundle at build time — it
+  couples the client image to one server identity, and the bundle comes from a server too
+  (D008), so it moves the trust question without answering it. (c) Silently caching the
+  first key in `localStorage` — pin-on-first-use that hides itself is the case D016 was
+  written against.
+- **Why:** This is a deliberate, visible exception to D016 for the demo. It makes the
+  boundary a talking point instead of a hidden assumption: with a pre-filled pin the
+  handshake proves only that the server agrees with itself, so the key's authenticity
+  collapses to the TLS hop that delivered `/pubkey`. Locally that hop ends at the server;
+  behind the cloud proxy + WAF it ends at the intermediary D005 is about, which could
+  substitute key and signature together. The conformant path (a pasted out-of-band pin) is
+  one paste away and is what the red-team claims in `threat-model.md` still rest on.
