@@ -5,7 +5,7 @@
 #
 #   ./db/gen-db-certs.sh && cp db/.env.example db/.env               # edit password
 #   ./server/certs/gen-server-certs.sh                                # server CA + leaf; trust server-ca.crt in the browser
-#   cp server/.env.example server/.env                                # identity (python generate_keys.py) + DATABASE_URL
+#   cp server/.env.example server/.env                                # identity (python generate_keys.py) + db password
 #   docker compose up -d --build
 include:
   - path: ./db/docker-compose.yml
@@ -18,17 +18,14 @@ services:
     restart: unless-stopped
     env_file:
       - ./server/.env              # SERVER_ED25519_PRIVATE_KEY_HEX, SERVER_NAME, DATABASE_URL, retention
-    environment:
+    environment:                   # the same .env as a host run; only the paths and the db host differ in here
+      DB_HOST: db
       DB_SSLROOTCERT: /app/certs/db-ca.crt
       EPOCH_DB_PATH: /data/epoch_keys.sqlite3
     volumes:
       - ./db/certs/db-ca.crt:/app/certs/db-ca.crt:ro   # what verify-full trusts
       - ./server/certs:/app/certs/tls:ro                 # this server's TLS leaf + the server CA (D030)
       - epochkeys:/data                                  # sealed epoch keys stay on THIS host (D024/D031)
-    command:
-      - sh
-      - -c
-      - exec uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile /app/certs/tls/$${SERVER_NAME:-echovault}.key --ssl-certfile /app/certs/tls/$${SERVER_NAME:-echovault}.crt
     ports:
       - "8443:8443"
     depends_on:

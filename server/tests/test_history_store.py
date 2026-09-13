@@ -183,6 +183,18 @@ def test_service_duplicate_epoch_raises(epochs):
 
 # ── Postgres (only with a real database) ─────────────────────────────────────
 
+def test_postgres_host_override_is_applied(monkeypatch):
+    """DB_HOST swaps the DSN host (compose → `db`) before anything else is checked."""
+    seen = {}
+    def fake_connect(conninfo, autocommit=True):
+        seen["conninfo"] = conninfo
+        raise RuntimeError("stop here")
+    monkeypatch.setattr("psycopg.connect", fake_connect)
+    with pytest.raises(RuntimeError, match="stop here"):
+        PostgresRecordStore("postgresql://u:p@localhost/db?sslmode=verify-full&sslrootcert=/x", host="db")
+    assert "host=db" in seen["conninfo"] and "localhost" not in seen["conninfo"]
+
+
 def test_postgres_refuses_without_verify_full():
     with pytest.raises(RuntimeError):
         PostgresRecordStore("postgresql://u:p@localhost/db?sslmode=require&sslrootcert=/x")
