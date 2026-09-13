@@ -86,6 +86,24 @@ def test_epoch_erase_expired_is_inclusive_at_window(epochs):
     assert [k.epoch_id for k in epochs.live(OWNER_A)] == [EPOCH_2]
 
 
+@pytest.mark.parametrize("reopen", [False, True])                  # key still in the WAL / already in the main file
+def test_epoch_erase_leaves_no_key_bytes_on_disk(tmp_path, reopen):
+    """An erased sealed key is gone from the database file and the WAL, not just unlinked."""
+    path = tmp_path / "epochs.sqlite3"
+    store = EpochKeyStore(str(path))
+    secret = b"sealed-epoch-key-must-not-survive-erasure-000000"   # 48 bytes, like ct
+    store.insert(OWNER_A, SealedEpochKey(EPOCH_1, b"e" * 32, secret, 0))
+    store.insert(OWNER_A, key(EPOCH_2, 10**9))                      # a live neighbour on the same page
+    if reopen:
+        store.close()                                               # last close checkpoints into the main file
+        store = EpochKeyStore(str(path))
+    assert store.erase_expired(now=100, window_s=100) == [(OWNER_A, EPOCH_1)]
+    for f in (path, tmp_path / "epochs.sqlite3-wal"):               # read while the store is still open
+        if f.exists():
+            assert secret not in f.read_bytes(), f.name
+    store.close()
+
+
 def test_epoch_store_persists_across_reopen(tmp_path):
     path = str(tmp_path / "epochs.sqlite3")
     s = EpochKeyStore(path)
