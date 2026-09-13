@@ -342,6 +342,10 @@ Go, and Rust.
 - **Why:** The remote location, and every backup of it, holds ciphertext that nothing *in that
   location* can decrypt. The erasure authority sits on the box the operator controls. The
   interface boundary is what makes the database swappable without touching the protocol.
+- **Update (ADR 5):** erasure means the bytes, not the row. The SQLite store runs with
+  `secure_delete=ON` and truncates its WAL after each erase, so a copy of the file taken
+  afterwards holds no expired key. Volume snapshots of the host are the same problem as
+  database backups and are settled by placement (ADR 4).
 
 ### D025 — Echoes are not stored; the browser reconstructs them on replay ✅
 - **Chose:** Persist prompts only. On replay the browser renders `ECHO: <text>` for each

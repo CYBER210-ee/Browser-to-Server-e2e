@@ -1,6 +1,6 @@
 # ADR 5 — Client fixes
 
-Branch: `agent/cs212/client_fixes` (on top of `main`) · Status: fix 1 implemented, awaiting push + manual review · Previous: ADR 4 cloud deployment (scoping)
+Branch: `agent/cs212/client_fixes` (on top of `main`) · Status: fixes 1–2 implemented, awaiting push + manual review · Previous: ADR 4 cloud deployment (scoping)
 
 ## Goal
 
@@ -43,10 +43,28 @@ then checks the server against that answer. It is kept as a demo talking point: 
 3. Paste the pin from the server console → chip loses *TOFU*; Verify → green for a reason.
 4. Paste any other valid key → red: the gate still works when the pin is independent.
 
+## Fix 2 — Erased epoch keys leave no bytes in the SQLite file (server)
+
+Not a client change, but it came out of the same review. Expiry is the server erasing a
+sealed epoch key (D022), and a plain `DELETE` does not erase: SQLite leaves the row in free
+pages of the database file, and in WAL mode the frame that inserted it stays in `-wal` until
+it is overwritten. Anyone who later gets the file plus the mnemonic could recover history
+past its window.
+
+### Checklist
+- [x] `server/history_store.py`: `PRAGMA secure_delete=ON`; `wal_checkpoint(TRUNCATE)` after
+      an erase that removed rows
+- [x] Test: an erased key's bytes are absent from the database file and the WAL, with the key
+      still in the WAL and after it was checkpointed into the main file. Each half of the fix
+      alone fails one of the cases
+- [x] D024 note; ADR 4 scoping item on where the keys live in AWS
+
+Residual: the filesystem, SSD wear-levelling and volume snapshots are below SQLite. In the
+cloud that is a placement question (ADR 4), not a code one.
+
 ## Out of scope
 
-A pin list per server (ADR 4) · pin persistence in the browser (pin-on-first-use caching) ·
-any server change.
+A pin list per server (ADR 4) · pin persistence in the browser (pin-on-first-use caching).
 
 ## Dependencies
 
